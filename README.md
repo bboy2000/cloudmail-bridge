@@ -337,4 +337,15 @@ A：网关对域名下所有邮箱生效。不想让某个账号使用，直接�
 
 ---
 
+## 镜像版本
+
+镜像标签与 Git 版本一一对应：
+
+- `latest`：始终指向最新稳定版（compose 示例默认用这个）；
+- `v1.00`、`v1.01` …：固定版本，想锁定版本可把 compose 里的 `latest` 换成对应标签，避免自动升级。
+
+Dockerfile 与镜像内均带有版本号（`org.opencontainers.image.version`），可用 `docker inspect` 查看。
+
+---
+
 *文档版本：v1.05*
