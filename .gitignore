@@ -1,0 +1,29 @@
+# 真实凭据（绝不入库）
+config.json
+deploy/config.json
+*.pem
+*.key
+certs/
+
+# 编译产物
+*.exe
+cloudmail-bridge
+cloudmail-bridge-linux-*
+cloudmail-bridge-*-linux-*
+deploy/cloudmail-bridge
+
+# 开发调试目录（含本机/内网信息，不发布）
+deploy/
+tlscheck/
+readtest/
+smtptest/
+idletest/
+testclient/
+multiaccounttest/
+
+# 旧版文档（只保留最新 INSTALL）
+docs/INSTALL-v1.00.md
+docs/INSTALL-v1.01.md
+docs/INSTALL-v1.02.md
+docs/INSTALL-v1.03.md
+docs/INSTALL-v1.04.md

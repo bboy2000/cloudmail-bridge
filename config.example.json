@@ -1,0 +1,18 @@
+{
+  "base_url": "https://mail.example.com",
+  "domain": "example.com",
+  "listen_addr": "0.0.0.0:993",
+  "smtp_listen_addr": "0.0.0.0:465",
+  "poll_interval": 60,
+  "page_size": 100,
+  "max_pages": 0,
+  "insecure_auth": false,
+  "tls_mode": "implicit",
+  "cert_file": "/app/certs/fullchain.pem",
+  "key_file": "/app/certs/key.pem",
+  "admin_email": "",
+  "admin_password": "",
+  "public_token": "",
+  "jwt_cache_ttl": 12,
+  "sync_interval": 2
+}
