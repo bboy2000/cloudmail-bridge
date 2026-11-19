@@ -1,6 +1,8 @@
-# cloudmail-bridge 安装指南 v1.09
+# cloudmail-bridge 安装指南 v1.10
 
-一个把 cloud-mail 网页邮箱桥接成标准 IMAP/SMTP 服务的网关。部署后可用任意邮件客户端（Outlook、Thunderbird、Apple 邮件、手机自带邮箱等）收发 cloud-mail 里的邮件。
+一个把 [cloud-mail](https://github.com/maillab/cloud-mail) 网页邮箱桥接成标准 IMAP/SMTP 服务的网关。部署后可用任意邮件客户端（Outlook、Thunderbird、Apple 邮件、手机自带邮箱等）收发 cloud-mail 里的邮件。
+
+> 相关链接：[cloud-mail 源码仓库](https://github.com/maillab/cloud-mail) · [cloud-mail 官方文档](https://docs.skymail.ink)（部署 cloud-mail 站点请看这里，本仓库只负责 IMAP/SMTP 网关）
 
 - 支持 cloud-mail 站点里的**所有账号**（含以后新增的），无需在网关里逐个配置；
 - 账号密码由 cloud-mail 网站实时验证，改密码后客户端旧密码立即失效；
@@ -39,7 +41,9 @@
 
 ### 2. 一个 cloud-mail 实例
 
-你需要有一个自己搭建好的 cloud-mail 站点（它的根地址就是下面 compose 里的 `BASE_URL`，例如 `https://mail.example.com`），以及在网站上建好的邮箱账号（邮箱地址 + 密码）。客户端用哪个邮箱登录，就是哪个账号——网关不需要管理员账号。
+你需要有一个自己搭建好的 [cloud-mail](https://github.com/maillab/cloud-mail) 站点（它的根地址就是下面 compose 里的 `BASE_URL`，例如 `https://mail.example.com`），以及在网站上建好的邮箱账号（邮箱地址 + 密码）。客户端用哪个邮箱登录，就是哪个账号——网关不需要管理员账号。
+
+> 还没有 cloud-mail 站点？先按官方文档部署：<https://docs.skymail.ink> （源码：<https://github.com/maillab/cloud-mail>）。本仓库只是 IMAP/SMTP 网关，不包含 cloud-mail 本体。
 
 ### 3. 创建安装目录
 
@@ -422,4 +426,4 @@ Dockerfile 与镜像内均带有版本号（`org.opencontainers.image.version`�
 
 ---
 
-*文档版本：v1.09*
+*文档版本：v1.10*
