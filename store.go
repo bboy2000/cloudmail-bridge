@@ -257,29 +257,39 @@ func (s *mailStore) setSeen(user, mailbox string, uid imap.UID, seen bool) {
 
 // applyUnread 用远端的 unread 状态校正已入库 INBOX 邮件的 seen 标记。
 // 只校正状态不同的，且不触发回写（这是远端 -> 本地的单向校正）。
+//
+// 重要：已读状态只允许单向「未读 -> 已读」，绝不把本地已读改回未读。
+// 原因：cloud-mail 只有「标记已读」接口，没有「标记未读」接口，
+// 所以云端的 unread 一旦变已读就不会回退。若云端返回未读而本地已读，
+// 只可能是回写失败或尚未完成；此时必须信任本地，否则用户点开过的邮件
+// 会在下一个同步周期被改回未读（客户端刷新后看到"又变未读了"）。
 func (s *mailStore) applyUnread(user string, unreadMap map[int64]bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	changed := 0
+	changed, keptRead := 0, 0
 	for _, m := range s.data[user]["INBOX"] {
 		want, ok := unreadMap[m.emailID]
 		if !ok {
 			continue
 		}
-		if m.seen != want {
-			m.seen = want
-			m.flags = []imap.Flag{}
-			if want {
-				m.flags = append(m.flags, imap.FlagSeen)
-			}
-			if m.deleted {
-				m.flags = append(m.flags, imap.FlagDeleted)
-			}
-			changed++
+		if m.seen == want {
+			continue
 		}
+		if !want {
+			// 本地已读、云端未读：回写未完成或失败，保留本地已读，不回退。
+			keptRead++
+			continue
+		}
+		m.seen = true
+		m.flags = []imap.Flag{}
+		m.flags = append(m.flags, imap.FlagSeen)
+		if m.deleted {
+			m.flags = append(m.flags, imap.FlagDeleted)
+		}
+		changed++
 	}
-	if changed > 0 {
-		log.Printf("[store] user=%s unread 校正 %d 封", user, changed)
+	if changed > 0 || keptRead > 0 {
+		log.Printf("[store] user=%s unread 校正：置已读 %d 封，保留本地已读 %d 封（云端仍报未读）", user, changed, keptRead)
 	}
 }
 

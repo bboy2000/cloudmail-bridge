@@ -285,11 +285,30 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 	// 客户端点了"收取历史邮件 / 下载全部邮件"时，会发覆盖全部邮件的正文拉取请求。
 	// 这时把已删记录清空并重新拉取，让被删掉的邮件重新出现。
 	// 每个连接只处理一次，避免客户端反复遍历时重复触发同步。
-	if !s.restored && s.selected == "INBOX" && fetchAllRequested(numSet, options, msgs) {
+	allRequest := fetchAllRequested(numSet, options, msgs)
+
+	if !s.restored && s.selected == "INBOX" && allRequest {
 		if n := s.store.deletedCount(s.user); n > 0 {
 			s.restored = true
 			log.Printf("[fetch] user=%s 检测到「下载全部邮件」请求（已删 %d 封）-> 恢复", s.user, n)
 			s.store.restoreAll(s.user)
+		}
+	}
+
+	// IMAP 规范（RFC3501 6.4.5）：用 BODY[...]（非 PEEK）拉取正文时，
+	// 服务器必须隐式设置 \Seen —— 客户端"点开邮件"就是靠这个把邮件变已读的。
+	// 之前完全没处理，导致客户端界面看着是已读、服务器和云端其实还是未读，
+	// 一刷新就从服务器重读 FLAGS 变回未读。
+	//
+	// 例外：一次性拉全部邮件（如客户端"收取历史邮件"）不算阅读，不能标已读，
+	// 否则整箱邮件会在用户没看的情况下全变成已读。
+	needSeen := false
+	if !allRequest {
+		for _, bs := range options.BodySection {
+			if !bs.Peek {
+				needSeen = true
+				break
+			}
 		}
 	}
 
@@ -304,6 +323,13 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		}
 		if !matched {
 			continue
+		}
+
+		// 隐式已读必须在 WriteFlags 之前设置，这样返回给客户端的 FLAGS 才是最新的。
+		// setSeen 会顺带触发异步回写云端（onSeenChange）。
+		if needSeen && !m.seen {
+			s.store.setSeen(s.user, s.selected, m.uid, true)
+			log.Printf("[fetch] user=%s uid=%d 隐式标记已读（BODY[] 非 PEEK 拉取）", s.user, m.uid)
 		}
 
 		resp := w.CreateMessage(seq)
