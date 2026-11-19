@@ -34,6 +34,10 @@ type Config struct {
 
 	JWTCacheTTL  int `json:"jwt_cache_ttl"` // JWT 缓存小时数
 	SyncInterval int `json:"sync_interval"` // 同一邮箱两次同步最小间隔（分钟）
+
+	// 附件下载地址前缀。留空 = 用 base_url + "/" + att.key（对应官方源码无 r2Domain 时的本站代理）。
+	// 若站点配置了 R2/S3 自定义域名，填该域名（不带尾部斜杠），例如 https://cdn.example.com
+	AttachmentBaseURL string `json:"attachment_base_url"`
 }
 
 func defaultConfig() *Config {
@@ -87,6 +91,7 @@ func (c *Config) applyEnv() {
 	setStr(&c.TLSMode, "TLS_MODE")
 	setStr(&c.CertFile, "CERT_FILE", "TLS_CERT")
 	setStr(&c.KeyFile, "KEY_FILE", "TLS_KEY")
+	setStr(&c.AttachmentBaseURL, "ATTACHMENT_BASE_URL")
 	setInt(&c.PollInterval, "POLL_INTERVAL")
 	setInt(&c.SyncInterval, "SYNC_INTERVAL")
 	setInt(&c.PageSize, "PAGE_SIZE")

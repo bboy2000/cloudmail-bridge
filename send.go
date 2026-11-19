@@ -357,14 +357,25 @@ func (c *cloudMailClient) fetchAllEmailList(accountID int64, mailType int) ([]em
 }
 
 // 文档确认：receiveEmail 是 array<string>（纯邮箱字符串数组），不是对象数组
+// sendAttachment 是文档 #4 /api/email/send 的 attachments 子结构：
+// content 为文件内容 Base64，contentType 为 MIME，size 可选。
+type sendAttachment struct {
+	Filename    string `json:"filename"`
+	Content     string `json:"content"` // Base64
+	ContentType string `json:"contentType,omitempty"`
+	Size        int    `json:"size,omitempty"`
+}
+
 type sendEmailRequest struct {
-	AccountID    int64    `json:"accountId"`
-	Name         string   `json:"name,omitempty"`
-	ReceiveEmail []string `json:"receiveEmail"`
-	Subject      string   `json:"subject"`
-	Text         string   `json:"text,omitempty"`
-	Content      string   `json:"content,omitempty"` // HTML
-	SendType     string   `json:"sendType,omitempty"`
+	AccountID    int64            `json:"accountId"`
+	Name         string           `json:"name,omitempty"`
+	ReceiveEmail []string         `json:"receiveEmail"`
+	Subject      string           `json:"subject"`
+	Text         string           `json:"text,omitempty"`
+	Content      string           `json:"content,omitempty"` // HTML
+	SendType     string           `json:"sendType,omitempty"`
+	EmailID      int64            `json:"emailId,omitempty"` // reply 时必填（文档 #4）
+	Attachments  []sendAttachment `json:"attachments,omitempty"`
 }
 
 // sendEmail 通过 cloud-mail 的 /api/email/send 发信（内部走它配好的 Resend，并自动写 D1「已发送」）。

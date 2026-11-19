@@ -5,6 +5,11 @@ deploy/config.json
 *.key
 certs/
 
+# 抓 API 文档时的临时缓存
+apidoc_*.js
+apidoc_*.md
+apidoc_*.html
+
 # 编译产物
 *.exe
 cloudmail-bridge

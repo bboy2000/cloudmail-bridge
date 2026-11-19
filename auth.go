@@ -95,12 +95,8 @@ func (a *authManager) authenticate(email, password string) (*cloudMailClient, er
 		return nil, fmt.Errorf("invalid email")
 	}
 
-	// 建该用户专属 client，设置管理员凭据（用于 public token 拉收件 + token 过期自动续）
+	// 建该用户专属 client：收件/发件均走文档标准接口，用自己的 JWT。
 	c := newCloudMailClient(a.baseURL)
-	c.setAdmin(a.cfg.AdminEmail, a.cfg.AdminPassword)
-	if a.cfg.PublicToken != "" {
-		c.SetToken(a.cfg.PublicToken)
-	}
 	c.setLoginCred(email, password)
 
 	// 让用户 JWT 立刻生成。login() 内部直接打 /api/login，密码错会返回错误。
@@ -164,81 +160,58 @@ func (a *authManager) syncUser(email string, c *cloudMailClient, force bool) err
 		return nil
 	}
 
-	// 用该用户 JWT 发现名下所有账号
+	// 文档 #6：用该用户 JWT 发现名下所有邮箱账号。
 	accounts, err := c.listAccounts()
 	if err != nil {
 		log.Printf("[sync] %s listAccounts ERROR: %v", email, err)
 		return err
 	}
 	if len(accounts) == 0 {
-		// 兜底：至少同步登录邮箱本身
-		accounts = []mailAccount{{Email: email}}
-		log.Printf("[sync] %s 未发现账号，兜底用登录邮箱本身", email)
+		log.Printf("[sync] %s 名下无邮箱账号（/api/account/list 返回空），跳过同步", email)
+		return nil
 	}
-	emails := make([]string, 0, len(accounts))
-	for _, ac := range accounts {
-		if ac.Email != "" {
-			emails = append(emails, normEmail(ac.Email))
-		}
-	}
-	log.Printf("[sync] %s 名下账号(%d): %v", email, len(emails), emails)
+	log.Printf("[sync] %s 名下账号(%d)", email, len(accounts))
 
-	// 收件：public token 按每个账号的 toEmail 拉（管理员级可见全部收件）
-	for _, addr := range emails {
-		total := 0
-		for page := 1; ; page++ {
-			items, err := c.fetchEmailList(addr, 0, page, a.cfg.PageSize)
-			if err != nil {
-				log.Printf("[sync] %s inbox %s page=%d ERROR: %v", email, addr, page, err)
-				break
-			}
-			if len(items) == 0 {
-				break
-			}
-			total += a.store.addReceived(email, items, a.cfg.Domain, nil)
-			if a.cfg.MaxPages > 0 && page >= a.cfg.MaxPages {
-				break
-			}
-			if len(items) < a.cfg.PageSize {
-				break
-			}
-		}
-		log.Printf("[sync] %s <- %s 收件 +%d（累计 INBOX %d）", email, addr, total, len(a.store.messages(email, "INBOX")))
-	}
-
-	// unread 状态 + 真实发件：用该用户 JWT，按登录邮箱对应 accountId
-	acID := int64(0)
+	// 收件 + 发件全部走文档 #3 的标准接口 GET /api/email/list：
+	// 用每个账号自己的 accountId，type=0 收件 / type=1 发件，full=1 带正文+attList+unread。
+	// 不再使用 /api/public/emailList（文档未列出）。
+	totalRecv, totalSent := 0, 0
 	for _, ac := range accounts {
-		if normEmail(ac.Email) == email {
-			acID = ac.AccountID
-			break
+		if ac.AccountID <= 0 {
+			continue
 		}
-	}
-	if acID == 0 && len(accounts) > 0 {
-		acID = accounts[0].AccountID
-	}
-	if acID > 0 {
-		if recv, err := c.fetchAllEmailList(acID, 0); err == nil {
+
+		// 收件：标准接口直接返回 unread，同一份数据既入库又校正已读状态。
+		recv, err := c.fetchAllEmailList(ac.AccountID, 0)
+		if err != nil {
+			log.Printf("[sync] %s 收件 accountId=%d ERROR: %v", email, ac.AccountID, err)
+		} else {
+			a.enrichAttachments(c, email, recv)
 			um := make(map[int64]bool, len(recv))
 			for _, it := range recv {
 				um[it.EmailID] = it.Unread == 1
 			}
 			a.store.applyUnread(email, um)
-			a.store.addReceived(email, recv, a.cfg.Domain, um)
-		} else {
-			log.Printf("[sync] %s unread ERROR: %v", email, err)
+			totalRecv += a.store.addReceived(email, recv, a.cfg.Domain, um)
+			log.Printf("[sync] %s <- %s 收件 %d 封（accountId=%d）", email, ac.Email, len(recv), ac.AccountID)
 		}
-		if sent, err := c.fetchAllEmailList(acID, 1); err == nil {
-			a.store.addSentFromCloud(email, sent, a.cfg.Domain)
+
+		// 发件：标准接口 type=1。
+		sent, err := c.fetchAllEmailList(ac.AccountID, 1)
+		if err != nil {
+			log.Printf("[sync] %s 发件 accountId=%d ERROR: %v", email, ac.AccountID, err)
 		} else {
-			log.Printf("[sync] %s sent ERROR: %v", email, err)
+			a.enrichAttachments(c, email, sent)
+			totalSent += a.store.addSentFromCloud(email, sent, a.cfg.Domain)
+			log.Printf("[sync] %s -> %s 发件 %d 封（accountId=%d）", email, ac.Email, len(sent), ac.AccountID)
 		}
 	}
 
 	a.mu.Lock()
 	e.syncedAt = time.Now()
 	a.mu.Unlock()
-	log.Printf("[sync] %s 同步完成", email)
+	log.Printf("[sync] %s 同步完成：收件 +%d 发件 +%d（INBOX %d / Sent %d）", email,
+		totalRecv, totalSent, len(a.store.messages(email, "INBOX")), len(a.store.messages(email, "Sent")))
 	return nil
 }
 

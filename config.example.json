@@ -14,5 +14,6 @@
   "admin_password": "",
   "public_token": "",
   "jwt_cache_ttl": 12,
-  "sync_interval": 2
+  "sync_interval": 2,
+  "attachment_base_url": ""
 }

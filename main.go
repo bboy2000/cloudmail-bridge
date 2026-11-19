@@ -250,9 +250,15 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			}
 			resp.WriteEnvelope(env)
 		}
+		if options.BodyStructure != nil {
+			resp.WriteBodyStructure(bodyStructureOf(m.raw))
+		}
 		for _, bs := range options.BodySection {
-			wc := resp.WriteBodySection(bs, int64(len(m.raw)))
-			_, _ = wc.Write(m.raw)
+			// BODY.PEEK[HEADER] / [HEADER.FIELDS] / [TEXT] / [n] 必须按 section 切片，
+			// 不能一律返回整封 raw —— 否则严格客户端（网易邮箱大师）会丢弃邮件。
+			data := sectionBytes(m.raw, bs)
+			wc := resp.WriteBodySection(bs, int64(len(data)))
+			_, _ = wc.Write(data)
 			_ = wc.Close()
 		}
 		if err := resp.Close(); err != nil {

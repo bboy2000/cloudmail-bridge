@@ -156,8 +156,8 @@ func (s *smtpSession) Data(r io.Reader) error {
 		return errors.New("no recipients")
 	}
 
-	log.Printf("[smtp] sending: from=%s to=%v subject=%q textLen=%d htmlLen=%d",
-		s.from, recipients, msg.Subject, len(msg.Text), len(msg.HTML))
+	log.Printf("[smtp] sending: from=%s to=%v subject=%q textLen=%d htmlLen=%d atts=%d",
+		s.from, recipients, msg.Subject, len(msg.Text), len(msg.HTML), len(msg.Attachments))
 
 	// 用该会话登录用户的专属 client 发现其名下账号（JWT 隔离）
 	cl := s.client
@@ -204,6 +204,7 @@ func (s *smtpSession) Data(r io.Reader) error {
 		Subject:      msg.Subject,
 		Text:         msg.Text,
 		Content:      msg.HTML,
+		Attachments:  msg.Attachments,
 	}
 	emailID, err := cl.sendEmail(sendReq)
 	if err != nil {
@@ -239,12 +240,90 @@ func extractAddr(s string) string {
 // ========== RFC822 解析 ==========
 
 type incomingMail struct {
-	Subject  string
-	FromName string
-	From     []string
-	To       []string
-	Text     string
-	HTML     string
+	Subject     string
+	FromName    string
+	From        []string
+	To          []string
+	Text        string
+	HTML        string
+	Attachments []sendAttachment // 文档 #4 发信附件（Base64）
+}
+
+// collectParts 递归遍历 MIME 树：正文写进 out，附件（Content-Disposition: attachment
+// 或非 text 的 part）解码后追加到 out.Attachments。发信接口要 Base64，这里直接编码。
+func collectParts(out *incomingMail, mediaType string, params map[string]string, headers mail.Header, body []byte) {
+	switch {
+	case strings.HasPrefix(mediaType, "multipart/"):
+		mr := multipart.NewReader(strings.NewReader(string(body)), params["boundary"])
+		for {
+			part, err := mr.NextPart()
+			if err == io.EOF || err != nil {
+				break
+			}
+			pb, _ := io.ReadAll(part)
+			pct, pparams, err := mime.ParseMediaType(part.Header.Get("Content-Type"))
+			if err != nil {
+				pct = "text/plain"
+				pparams = nil
+			}
+			collectParts(out, pct, pparams, mail.Header(part.Header), pb)
+		}
+	case mediaType == "text/html":
+		if out.HTML == "" {
+			out.HTML = decodeBody(body, headers.Get("Content-Transfer-Encoding"))
+		}
+	case mediaType == "text/plain":
+		if out.Text == "" {
+			out.Text = decodeBody(body, headers.Get("Content-Transfer-Encoding"))
+		}
+	default:
+		// 非 text/* 视为附件（image/audio/application 等）
+		addAttachment(out, headers, mediaType, body)
+	}
+}
+
+// addAttachment 把一个 part 作为发信附件追加：原始字节转 Base64。
+// 内嵌图片（Content-ID + related）也一并作为附件发送，至少不丢资源。
+func addAttachment(out *incomingMail, headers mail.Header, mediaType string, body []byte) {
+	disp, dparams, _ := mime.ParseMediaType(headers.Get("Content-Disposition"))
+	filename := dparams["filename"]
+	if filename == "" {
+		filename = headers.Get("Content-Type")
+		if f, p, err := mime.ParseMediaType(filename); err == nil {
+			filename = p["name"]
+			mediaType = f
+		}
+	}
+	if filename == "" {
+		// 有 Content-ID 的内嵌图片：用 cid 作文件名
+		if cid := strings.Trim(headers.Get("Content-ID"), "<> "); cid != "" {
+			filename = cid
+		}
+	}
+	if filename == "" {
+		filename = fmt.Sprintf("attachment-%d", len(out.Attachments)+1)
+	}
+	// 客户端（网易/QQ 等）常把附件名做成 RFC2047 编码：
+	//   =?utf-8?Q?xxx=5Fyyy.jpg?=  或  =?utf-8?B?...?=
+	// 不解码就原样发给 cloud-mail，站点会把 ? 当特殊字符替换，对方收到就是乱码
+	// （如 =-utf-8-Q-...-=）。这里按 RFC2047 解回真实文件名；普通文件名不受影响。
+	if decoded, derr := (&mime.WordDecoder{}).DecodeHeader(filename); derr == nil && decoded != "" {
+		filename = decoded
+	}
+	filename = safeFilename(filename)
+	if mediaType == "" {
+		mediaType = "application/octet-stream"
+	}
+	_ = disp // disposition 仅用于命名，附件与否由 mediaType 判定
+	// body 是按 Content-Transfer-Encoding 编码的（常见 base64）：
+	// 必须先解码回原始字节，再编码给发信接口，否则会双重 base64 发出乱码。
+	raw := []byte(decodeBody(body, headers.Get("Content-Transfer-Encoding")))
+	out.Attachments = append(out.Attachments, sendAttachment{
+		Filename:    filename,
+		Content:     base64.StdEncoding.EncodeToString(raw),
+		ContentType: mediaType,
+		Size:        len(raw),
+	})
 }
 
 func parseIncomingMail(raw []byte) (*incomingMail, error) {
@@ -276,34 +355,7 @@ func parseIncomingMail(raw []byte) (*incomingMail, error) {
 		mediaType = "text/plain"
 	}
 	body, _ := io.ReadAll(m.Body)
-
-	if strings.HasPrefix(mediaType, "multipart/") {
-		mr := multipart.NewReader(strings.NewReader(string(body)), params["boundary"])
-		for {
-			part, err := mr.NextPart()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				break
-			}
-			pct := part.Header.Get("Content-Type")
-			pb, _ := io.ReadAll(part)
-			text := decodeBody(pb, part.Header.Get("Content-Transfer-Encoding"))
-			if strings.HasPrefix(pct, "text/html") && out.HTML == "" {
-				out.HTML = text
-			} else if strings.HasPrefix(pct, "text/plain") && out.Text == "" {
-				out.Text = text
-			}
-		}
-	} else {
-		text := decodeBody(body, m.Header.Get("Content-Transfer-Encoding"))
-		if mediaType == "text/html" {
-			out.HTML = text
-		} else {
-			out.Text = text
-		}
-	}
+	collectParts(out, mediaType, params, m.Header, body)
 	return out, nil
 }
 

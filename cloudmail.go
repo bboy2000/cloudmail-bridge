@@ -31,19 +31,42 @@ type genTokenRequest struct {
 	Password string `json:"password"`
 }
 
+// mailAttachment 对应 API full=1 的 attList 元素。
+// 官方 API 文档只列出 attId/filename/mimeType/size，实际对象还带 key
+// （网页版用 cvtR2Url(att.key) 拼对象存储直链下载）。
+// Data 是网关下载后的字节，不参与 JSON 解码。
+type mailAttachment struct {
+	AttID    int64  `json:"attId"`
+	Filename string `json:"filename"`
+	MimeType string `json:"mimeType"`
+	Size     int64  `json:"size"`
+	Key      string `json:"key"`
+	Data     []byte `json:"-"`
+}
+
 type emailItem struct {
-	EmailID    int64  `json:"emailId"`
-	SendEmail  string `json:"sendEmail"`
-	SendName   string `json:"sendName"`
-	Subject    string `json:"subject"`
-	ToEmail    string `json:"toEmail"`
-	ToName     string `json:"toName"`
-	Type       int    `json:"type"`
-	CreateTime string `json:"createTime"`
-	Content    string `json:"content"` // HTML 正文
-	Text       string `json:"text"`    // 纯文本正文
-	IsDel      int    `json:"isDel"`
-	Unread     int    `json:"unread"`  // 0=未读 1=已读（/api/email/list 返回，public 接口不返回）
+	EmailID    int64            `json:"emailId"`
+	SendEmail  string           `json:"sendEmail"`
+	Name       string           `json:"name"`     // 文档 #3 标准字段：发件人名字
+	SendName   string           `json:"sendName"` // 兼容旧 public 接口的同义字段
+	Subject    string           `json:"subject"`
+	ToEmail    string           `json:"toEmail"`
+	ToName     string           `json:"toName"`
+	Type       int              `json:"type"`
+	CreateTime string           `json:"createTime"`
+	Content    string           `json:"content"` // HTML 正文
+	Text       string           `json:"text"`    // 纯文本正文
+	IsDel      int              `json:"isDel"`
+	Unread     int              `json:"unread"`  // 0=未读 1=已读
+	AttList    []mailAttachment `json:"attList"` // full=1 时返回
+}
+
+// senderName 发件人显示名：标准接口给 name，旧 public 接口给 sendName，优先用标准字段。
+func (it emailItem) senderName() string {
+	if strings.TrimSpace(it.Name) != "" {
+		return it.Name
+	}
+	return it.SendName
 }
 
 type apiResponse struct {

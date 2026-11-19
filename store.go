@@ -12,12 +12,51 @@ import (
 
 // storedMessage 是一条已转成 RFC822 的邮件。uid 直接沿用 cloud-mail 的 emailId（稳定唯一）。
 type storedMessage struct {
-	uid   imap.UID
-	emailID int64
-	raw   []byte
-	flags []imap.Flag
-	date  time.Time
-	seen  bool
+	uid       imap.UID
+	emailID   int64
+	raw       []byte
+	flags     []imap.Flag
+	date      time.Time
+	seen      bool
+	hasAttach bool // raw 里已包含附件（避免同步时重复下载）
+}
+
+// attachmentsReady 判断 item 的所有附件都已下载好，可以生成带附件的 raw。
+func attachmentsReady(it emailItem) bool {
+	if len(it.AttList) == 0 {
+		return false
+	}
+	for _, att := range it.AttList {
+		if len(att.Data) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// hasMessageWithAttachments 供附件下载前判断：该邮件已入库且 raw 已带附件则跳过，
+// 避免每次同步重复拉取同一附件（省对象存储流量）。
+func (s *mailStore) hasMessageWithAttachments(user string, emailID int64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, mb := range []string{"INBOX", "Sent"} {
+		for _, m := range s.data[user][mb] {
+			if m.emailID == emailID {
+				return m.hasAttach
+			}
+		}
+	}
+	return false
+}
+
+// findMessageLocked 在指定文件夹按 emailID 找邮件，调用方须持 s.mu。
+func (s *mailStore) findMessageLocked(user, mailbox string, emailID int64) *storedMessage {
+	for _, m := range s.data[user][mailbox] {
+		if m.emailID == emailID {
+			return m
+		}
+	}
+	return nil
 }
 
 // mailStore 全局内存存储：按 用户 -> 邮箱文件夹 -> 邮件列表 组织。
@@ -112,7 +151,16 @@ func (s *mailStore) addReceived(user string, items []emailItem, domain string, u
 
 	added := 0
 	for _, item := range items {
+		ready := attachmentsReady(item)
 		if s.knownIDs[user][item.EmailID] {
+			// 已入库但上次没拿到附件：这次补齐后重建 raw，让客户端可见附件。
+			if ready {
+				if old := s.findMessageLocked(user, "INBOX", item.EmailID); old != nil && !old.hasAttach {
+					old.raw = buildRawEmail(item, domain)
+					old.hasAttach = true
+					log.Printf("[store] user=%s emailId=%d 补齐附件 raw（INBOX）", user, item.EmailID)
+				}
+			}
 			continue
 		}
 		// createTime 是 UTC，按 UTC 解析（ParseInLocation+Local 会早 8 小时），再转本地展示
@@ -130,12 +178,13 @@ func (s *mailStore) addReceived(user string, items []emailItem, domain string, u
 			flags = append(flags, imap.FlagSeen)
 		}
 		m := &storedMessage{
-			uid:     imap.UID(item.EmailID),
-			emailID: item.EmailID,
-			raw:     buildRawEmail(item, domain),
-			flags:   flags,
-			date:    t,
-			seen:    seen,
+			uid:       imap.UID(item.EmailID),
+			emailID:   item.EmailID,
+			raw:       buildRawEmail(item, domain),
+			flags:     flags,
+			date:      t,
+			seen:      seen,
+			hasAttach: ready,
 		}
 		s.data[user]["INBOX"] = append(s.data[user]["INBOX"], m)
 		s.knownIDs[user][item.EmailID] = true
@@ -238,7 +287,15 @@ func (s *mailStore) addSentFromCloud(user string, items []emailItem, domain stri
 	s.ensureUser(user)
 	added := 0
 	for _, item := range items {
+		ready := attachmentsReady(item)
 		if s.knownIDs[user][item.EmailID] {
+			if ready {
+				if old := s.findMessageLocked(user, "Sent", item.EmailID); old != nil && !old.hasAttach {
+					old.raw = buildRawEmail(item, domain)
+					old.hasAttach = true
+					log.Printf("[store] user=%s emailId=%d 补齐附件 raw（Sent）", user, item.EmailID)
+				}
+			}
 			continue
 		}
 		// createTime 是 UTC，按 UTC 解析（ParseInLocation+Local 会早 8 小时），再转本地展示
@@ -251,12 +308,13 @@ func (s *mailStore) addSentFromCloud(user string, items []emailItem, domain stri
 		}
 		t = t.Local()
 		m := &storedMessage{
-			uid:     imap.UID(item.EmailID),
-			emailID: item.EmailID,
-			raw:     buildRawEmail(item, domain),
-			flags:   []imap.Flag{imap.FlagSeen}, // 发件默认已读
-			date:    t,
-			seen:    true,
+			uid:       imap.UID(item.EmailID),
+			emailID:   item.EmailID,
+			raw:       buildRawEmail(item, domain),
+			flags:     []imap.Flag{imap.FlagSeen}, // 发件默认已读
+			date:      t,
+			seen:      true,
+			hasAttach: ready,
 		}
 		s.data[user]["Sent"] = append(s.data[user]["Sent"], m)
 		s.knownIDs[user][item.EmailID] = true
@@ -306,86 +364,53 @@ func nextUID(msgs []*storedMessage) imap.UID {
 	return max + 1
 }
 
-// syncFromCloud 为所有配置用户拉取收件+发件。返回 用户->收件新增条数。
-// 收件仍走 public/emailList（拿正文），另用 JWT 的 /email/list 拿 unread 状态初始化；
-// 发件走 JWT 的 /email/list?type=1 拉真实记录进 Sent（重启不丢）。
+// syncFromCloud 为旧配置 users 做启动同步，返回 用户->收件新增条数。
+// 全部走文档 #3 标准接口 GET /api/email/list（需 JWT）：收件 type=0、发件 type=1、full=1。
+// 没有登录凭据（JWT）时标准接口不可用，直接跳过——不再回退到 public 隐藏接口。
 func syncFromCloud(client *cloudMailClient, cfg *Config, store *mailStore) map[string]int {
 	result := make(map[string]int)
 	users := cfg.Users
 	if len(users) == 0 {
-		log.Printf("[sync] 未配置 users，跳过同步（可在 config.json 里填 users）")
+		log.Printf("[sync] 未配置 users，跳过启动同步（新架构由客户端登录时按需同步）")
+		return result
+	}
+	if cfg.LoginPassword == "" {
+		log.Printf("[sync] 未配置 login_password，标准接口 /api/email/list 需要 JWT，跳过启动同步")
 		return result
 	}
 
-	// 有登录凭据才查 unread + 同步发件（需要 JWT）
-	canJWT := cfg.LoginPassword != ""
-	var accounts []mailAccount
-	if canJWT {
-		var err error
-		accounts, err = client.listAccounts()
-		if err != nil {
-			log.Printf("[sync] listAccounts ERROR (跳过 unread/Sent 同步): %v", err)
-			canJWT = false
-		}
+	accounts, err := client.listAccounts()
+	if err != nil {
+		log.Printf("[sync] listAccounts ERROR: %v（跳过启动同步）", err)
+		return result
 	}
 
 	for _, user := range users {
-		// --- 收件：public 接口翻页拉正文 ---
 		total := 0
-		for page := 1; ; page++ {
-			items, err := client.fetchEmailList(user, 0, page, cfg.PageSize)
+		for _, a := range accounts {
+			// 只同步该 user 对应的账号；找不到精确匹配时跳过，避免串号。
+			if !strings.EqualFold(a.Email, user) || a.AccountID <= 0 {
+				continue
+			}
+			recv, err := client.fetchAllEmailList(a.AccountID, 0)
 			if err != nil {
-				log.Printf("[sync] user=%s inbox page=%d ERROR: %v", user, page, err)
-				break
+				log.Printf("[sync] user=%s 收件 accountId=%d ERROR: %v", user, a.AccountID, err)
+			} else {
+				um := make(map[int64]bool, len(recv))
+				for _, it := range recv {
+					um[it.EmailID] = it.Unread == 1
+				}
+				store.applyUnread(user, um)
+				total += store.addReceived(user, recv, cfg.Domain, um)
 			}
-			if len(items) == 0 {
-				break
-			}
-			total += store.addReceived(user, items, cfg.Domain, nil)
-			if cfg.MaxPages > 0 && page >= cfg.MaxPages {
-				break
-			}
-			if len(items) < cfg.PageSize {
-				break
+			sent, err := client.fetchAllEmailList(a.AccountID, 1)
+			if err != nil {
+				log.Printf("[sync] user=%s 发件 accountId=%d ERROR: %v", user, a.AccountID, err)
+			} else {
+				store.addSentFromCloud(user, sent, cfg.Domain)
 			}
 		}
 		result[user] = total
-
-		// --- JWT 增强：unread 状态 + 真实发件 ---
-		if canJWT {
-			accountID := int64(0)
-			for _, a := range accounts {
-				if strings.EqualFold(a.Email, user) {
-					accountID = a.AccountID
-					break
-				}
-			}
-			if accountID == 0 && len(accounts) > 0 {
-				accountID = accounts[0].AccountID
-			}
-			if accountID > 0 {
-				// 收件 unread：拉全量收件，建 emailId -> 已读 映射，补齐已入库邮件的 seen
-				recv, err := client.fetchAllEmailList(accountID, 0)
-				if err != nil {
-					log.Printf("[sync] user=%s unread ERROR: %v", user, err)
-				} else {
-					unreadMap := make(map[int64]bool, len(recv))
-					for _, it := range recv {
-						unreadMap[it.EmailID] = it.Unread == 1
-					}
-					store.applyUnread(user, unreadMap)
-					// 也用这份数据补齐正文（public 接口若漏了某些信）
-					store.addReceived(user, recv, cfg.Domain, unreadMap)
-				}
-				// 发件：拉真实发件记录进 Sent
-				sent, err := client.fetchAllEmailList(accountID, 1)
-				if err != nil {
-					log.Printf("[sync] user=%s sent ERROR: %v", user, err)
-				} else {
-					store.addSentFromCloud(user, sent, cfg.Domain)
-				}
-			}
-		}
 	}
 	return result
 }
