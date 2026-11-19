@@ -1,4 +1,4 @@
-# cloudmail-bridge 安装指南 v1.10
+# cloudmail-bridge 安装指南 v1.11
 
 一个把 [cloud-mail](https://github.com/maillab/cloud-mail) 网页邮箱桥接成标准 IMAP/SMTP 服务的网关。部署后可用任意邮件客户端（Outlook、Thunderbird、Apple 邮件、手机自带邮箱等）收发 cloud-mail 里的邮件。
 
@@ -322,12 +322,18 @@ DNS API 验证不要求开放 80 端口，内网环境也能签发。
 | `PAGE_SIZE` | 每次拉取的邮件条数 | `100` |
 | `MAX_PAGES` | 最多拉取页数，`0` 表示全量 | `0` |
 | `JWT_CACHE_TTL` | 网站验证后 JWT 的有效小时数 | `12` |
+| `PROBE_ENABLED` | 增量探测：每轮先用 1 条请求检查有没有新邮件，没变就跳过全量拉取。**强烈建议开启**，能把云端读取量降到原来的 1/5 以下 | `true` |
+| `PROBE_FORCE_FULL` | 连续跳过多少轮后强制全量一次，用于校正网页版改动的已读状态。数值越大越省额度，但已读同步越慢 | `5` |
 | `ATTACHMENT_BASE_URL` | 附件下载地址前缀；留空 = 用 `BASE_URL` + `/` + 附件的 key（本站代理路径）。若站点把附件放在独立对象存储域名，填那个域名 | 空 |
 | `TZ` | 时区，建议 `Asia/Shanghai` | 容器默认 |
 
 > 旧版本的 `PUBLIC_TOKEN` / `ADMIN_EMAIL` / `ADMIN_PASSWORD` 已不再必需：网关改用每个客户端自己的账号密码登录。若你从旧版升级，可删掉这几项。
 
 关于 `POLL_INTERVAL` 与 `SYNC_INTERVAL`：为节省云端免费额度，网关只在有客户端连接时同步。轮询周期不宜设得过短（建议 ≥ 30 秒），否则可能触发云端数据库的免费读取上限，导致登录接口报错。
+
+关于 `PROBE_ENABLED`：开启后每轮同步先用一条 `size=1` 的轻量请求读取最新邮件 ID，若与上轮相同则跳过该账号的全量拉取。实测可把每轮读取量从"全部邮件"降到 1 行，降幅约 80%。首次同步（建立基线）和 `PROBE_FORCE_FULL` 到点时仍会全量，用于同步网页版改动的已读状态。
+
+> **关于邮件标志**：网关只支持 `\Seen`（已读）和 `\Deleted`（删除）两种标志，这两种都会与网页版双向同步。`\Flagged`（星标）、`\Answered`、`\Draft` 不支持——cloud-mail 的星标是独立数据表，读取它要额外请求，会多耗云端额度，因此没有实现。客户端若显示星标按钮，点击后不会保存（网关不会声明支持该标志，多数客户端会自动隐藏）。
 
 > 关于 cloud-mail 站点后台的 **Webhook / 回调**设置：那是把收到的邮件推送给外部系统（如自建服务、Bot）用的，与本网关无关。网关是通过 cloud-mail 的标准 API 主动拉取邮件的，不需要开启 Webhook，开了也不会影响网关。不用的功能建议关闭，少一分暴露面。
 
@@ -426,4 +432,25 @@ Dockerfile 与镜像内均带有版本号（`org.opencontainers.image.version`�
 
 ---
 
-*文档版本：v1.10*
+## 致谢
+
+本项目的实现离不开以下开源项目：
+
+- **[cloud-mail](https://github.com/maillab/cloud-mail)**（MIT）—— 邮件服务本体。网关通过它的 HTTP API 收发邮件；接口字段与附件地址规则参照其官方源码实现，代码注释中标注了对应位置。
+- **[go-imap](https://github.com/emersion/go-imap)**（MIT）—— IMAP 协议实现，网关的服务端框架。
+- **[go-smtp](https://github.com/emersion/go-smtp)**（MIT）—— SMTP 协议实现。
+- **[go-sasl](https://github.com/emersion/go-sasl)**（MIT）—— SASL 认证机制。
+- **[go-message](https://github.com/emersion/go-message)**（MIT）—— 邮件消息解析。
+- **[hydroxide](https://github.com/emersion/hydroxide)**（MIT）—— 同类的 ProtonMail 桥接网关。本项目的 `SEARCH` 条件匹配、`STATUS` 未读计数等实现参考了它的设计思路（未复制代码）。它在这些方面也有未完成的 TODO，本项目在其基础上补齐了。
+
+本仓库的代码为独立实现，未包含上述项目以外的第三方源码。
+
+---
+
+## 许可证
+
+本项目基于 [MIT 许可证](LICENSE) 开源。
+
+---
+
+*文档版本：v1.11*
