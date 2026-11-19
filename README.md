@@ -1,4 +1,4 @@
-# cloudmail-bridge 安装指南 v1.12
+# cloudmail-bridge 安装指南 v1.13
 
 一个把 [cloud-mail](https://github.com/maillab/cloud-mail) 网页邮箱桥接成标准 IMAP/SMTP 服务的网关。部署后可用任意邮件客户端（Outlook、Thunderbird、Apple 邮件、手机自带邮箱等）收发 cloud-mail 里的邮件。
 
@@ -433,7 +433,7 @@ bash uninstall.sh             # 确认无误后实际卸载
 
 脚本会依次完成：
 
-1. 停止并删除容器
+1. 删除容器
 2. 删除镜像
 3. 注销本项目的证书续期（**只动指向本安装目录的证书**，不会误删其他项目的）
 4. 删除安装目录
@@ -443,14 +443,14 @@ bash uninstall.sh             # 确认无误后实际卸载
 | 参数 | 作用 |
 | --- | --- |
 | `--dry-run` | 只打印将执行的操作，不做任何改动。建议先跑一次 |
-| `--keep-data` | 保留 `data/`（客户端已删邮件记录），其余照删 |
 | `-y` / `--yes` | 跳过交互确认 |
+| `安装目录` | 不给则用当前目录，例如 `bash uninstall.sh /vol1/1000/Docker/Cloud-mail-bridge` |
 
 安全措施：
 
 - 实际执行前必须手工输入 `yes` 才继续；
 - 证书清理是**按路径匹配**的——只有续期配置指向本安装目录的证书才会被注销。如果机器上还有别的域名证书在用，脚本会保留 acme.sh 的定时任务；
-- 目录删不掉时（`data/` 由容器以 root 写入）会明确报错并以非零退出，不会谎报成功。
+- 目录删不掉时（`data/` 由容器以 root 写入）会自动尝试 `sudo`，仍失败则明确报错并以非零退出，不会谎报成功。
 
 ### 卸载不会影响什么
 
@@ -530,4 +530,4 @@ Dockerfile 与镜像内均带有版本号（`org.opencontainers.image.version`�
 
 ---
 
-*文档版本：v1.12*
+*文档版本：v1.13*
