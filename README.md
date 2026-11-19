@@ -1,4 +1,4 @@
-# cloudmail-bridge 安装指南 v1.08
+# cloudmail-bridge 安装指南 v1.09
 
 一个把 cloud-mail 网页邮箱桥接成标准 IMAP/SMTP 服务的网关。部署后可用任意邮件客户端（Outlook、Thunderbird、Apple 邮件、手机自带邮箱等）收发 cloud-mail 里的邮件。
 
@@ -39,7 +39,7 @@
 
 ### 2. 一个 cloud-mail 实例
 
-你需要有一个自己搭建好的 cloud-mail 站点（它的根地址下称 `CLOUDMAIL_URL`，例如 `https://mail.example.com`），以及在网站上建好的邮箱账号（邮箱地址 + 密码）。客户端用哪个邮箱登录，就是哪个账号——网关不需要管理员账号。
+你需要有一个自己搭建好的 cloud-mail 站点（它的根地址就是下面 compose 里的 `BASE_URL`，例如 `https://mail.example.com`），以及在网站上建好的邮箱账号（邮箱地址 + 密码）。客户端用哪个邮箱登录，就是哪个账号——网关不需要管理员账号。
 
 ### 3. 创建安装目录
 
@@ -88,11 +88,15 @@ mkdir -p cloudmail-bridge && cd cloudmail-bridge
 
    ```bash
    curl -fsSL -o cert.sh \
-     https://raw.githubusercontent.com/<你的用户名>/cloudmail-bridge/main/tools/cert.sh
+     https://raw.githubusercontent.com/bboy2000/cloudmail-bridge/main/tools/cert.sh
    bash cert.sh
    ```
 
    脚本会依次询问：证书目录 → 选 DNS 服务商（1 Cloudflare / 2 腾讯云 DNSPod / 3 阿里云 / 4 腾讯云）→ 输入 API 凭证 → 输入域名 → 续期后要重启的容器名。确认后它会自动完成：安装 acme.sh（国内走 Gitee 镜像）→ 申请 ECC 证书 → 安装到 `./certs/fullchain.pem` 和 `./certs/key.pem` → 配置自动续期，续期后自动重启容器。
+
+   > 证书目录直接回车即用当前目录下的 `certs/`，与下面 compose 里的 `./certs:/app/certs:ro` 对应，保持默认即可。
+   >
+   > 首次部署时容器还没创建，脚本最后那步"重启容器"会因容器不存在而被跳过，属正常现象，不影响证书；容器起来后自动读取证书。
 
 3. 常用管理命令（直接拷贝粘贴）：
 
@@ -101,10 +105,11 @@ mkdir -p cloudmail-bridge && cd cloudmail-bridge
    ~/.acme.sh/acme.sh --list
 
    # 查看自动续期任务（应看到 acme.sh --cron 那一行）
-   crontab -l | grep acme.sh
+   crontab -l 2>/dev/null | grep acme.sh
 
    # 测试续期是否正常（只检查，不实际执行）
-   ~/.acme.sh/acme.sh --renew -d "mail.example.com" --test
+   # 注意 --ecc：脚本签发的是 ECC 证书，不加这个参数会报找不到证书
+   ~/.acme.sh/acme.sh --renew -d "mail.example.com" --ecc --test
    ```
 
 #### DNS 服务商对照表（通俗说明）
@@ -158,7 +163,7 @@ services:
 ```bash
 docker compose pull
 docker compose up -d
-docker logs -f cloudmail-bridge
+docker compose logs -f
 ```
 
 看到 IMAP/SMTP 监听且无报错即成功。更新时重跑 `docker compose pull && docker compose up -d`。
@@ -184,13 +189,14 @@ docker logs -f cloudmail-bridge
 
 方案B 的域名由 ddns-go 动态更新，同样用 DNS API 验证（前提是域名托管在有 API 的服务商，比如 Cloudflare / DNSPod / 阿里云 / 腾讯云），**直接复用第三节的 `cert.sh` 一键脚本**即可——把"选 DNS 服务商"那一步按你的托管商选，其余完全一样，证书同样装到 `./certs/`。
 
-只有一种情况需要额外操作：你的域名托管商**不在**上面的对照表里（没有 DNS API）。这时用 DNS 别名（CNAME）方式委托验证：
+只有一种情况需要额外操作：你的域名托管商**不在**上面的对照表里（没有 DNS API）。这时用 DNS 别名（CNAME）方式委托验证。以"要签 `dynamic.example.com`、但只有 `mail.example.com` 的 DNS 能加记录"为例：
 
 ```bash
-# 1) 在你的主域名下加一条 CNAME（以 Cloudflare 托管主域名为例）
-#    _acme-challenge.mail.example.com  ->  mail.example.com
+# 1) 在 mail.example.com 的 DNS 里加一条 CNAME（指向 mail.example.com 本身）
+#    _acme-challenge.dynamic.example.com  ->  mail.example.com
+#    注意：左边是【要签的域名】，别写反。
 
-# 2) 用 CNAME 别名模式申请（--dns dns_cf 换成你主域名托管商的插件）
+# 2) 用别名模式申请（--domain-alias 填能加记录的那个域名）
 export CF_Token="你的主域名服务商Token"
 export CF_Zone_ID="你的主域名ZoneID"
 ~/.acme.sh/acme.sh --issue --dns dns_cf \
@@ -201,10 +207,14 @@ export CF_Zone_ID="你的主域名ZoneID"
 ~/.acme.sh/acme.sh --install-cert -d "dynamic.example.com" --ecc \
   --key-file "$(pwd)/certs/key.pem" \
   --fullchain-file "$(pwd)/certs/fullchain.pem" \
-  --reloadcmd "docker restart cloudmail-bridge"
+  --reloadcmd "docker restart cloudmail-bridge 2>/dev/null || true"
 ```
 
 DNS API 验证不要求开放 80 端口，内网环境也能签发。
+
+> `--domain-alias` 与 `--challenge-alias` 作用相同，区别只在 CNAME 的写法：用 `--domain-alias mail.example.com` 时 CNAME 指向 `mail.example.com`；用 `--challenge-alias mail.example.com` 时 CNAME 要写成 `_acme-challenge.mail.example.com`。
+>
+> 这条 CNAME 记录**签发后不要删**，续期时还要用。
 
 ### 3. compose 差异
 
@@ -359,7 +369,7 @@ DNS API 验证不要求开放 80 端口，内网环境也能签发。
 ## 九、常见问题
 
 **Q：客户端提示"密码错误"，但我没改密码？**
-A：网关的认证是实时调用 cloud-mail 网站完成的。网站若因数据库超限、服务异常等原因返回错误（如 Cloudflare 1102 资源超限），网关也会表现为认证/发信失败。请先看网关日志（`docker logs cloudmail-bridge`）里的具体报错，不要盲目改密码；这类站点临时故障通常稍后重试即恢复。
+A：网关的认证是实时调用 cloud-mail 网站完成的。网站若因数据库超限、服务异常等原因返回错误（如 Cloudflare 1102 资源超限），网关也会表现为认证/发信失败。请先看网关日志（`docker compose logs --tail=50`）里的具体报错，不要盲目改密码；这类站点临时故障通常稍后重试即恢复。
 
 **Q：还需要生成 public token 吗？**
 A：不需要。从本版本起网关改用标准接口 + 每个账号自己的登录密码，不再依赖 public token。旧配置里如果还留着 `PUBLIC_TOKEN`，可以删掉。
@@ -399,13 +409,17 @@ A：早期版本有过时区问题，请使用本版本或更新版本。
 
 ## 镜像版本
 
-镜像标签与 Git 版本一一对应：
-
 - `latest`：始终指向最新稳定版（compose 示例默认用这个）；
-- `v1.00`、`v1.01` …：固定版本，想锁定版本可把 compose 里的 `latest` 换成对应标签，避免自动升级。
+- 目前只提供 `latest` 一个标签，没有按版本号发布的固定标签。
+
+如果你需要锁定某个版本（避免 `pull` 后自动升级），可以先给仓库打一个 `v*` 形式的 Git tag（例如 `v1.08`），CI 会自动构建并推送同名镜像标签，之后就能在 compose 里写 `:v1.08`：
+
+```bash
+git tag v1.08 && git push origin v1.08
+```
 
 Dockerfile 与镜像内均带有版本号（`org.opencontainers.image.version`），可用 `docker inspect` 查看。
 
 ---
 
-*文档版本：v1.08*
+*文档版本：v1.09*

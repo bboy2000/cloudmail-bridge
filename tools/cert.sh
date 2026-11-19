@@ -176,7 +176,7 @@ info "第 4 步：安装证书到 $CERT_DIR ..."
 "$ACME" --install-cert -d "$DOMAIN" --ecc \
   --key-file "$CERT_DIR/key.pem" \
   --fullchain-file "$CERT_DIR/fullchain.pem" \
-  --reloadcmd "docker restart $CTAINER"
+  --reloadcmd "docker restart $CTAINER 2>/dev/null || true"
 ok "证书已安装到：$CERT_DIR/fullchain.pem 和 $CERT_DIR/key.pem"
 
 # ---------- 自动续期 ----------
