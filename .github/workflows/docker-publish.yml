@@ -2,7 +2,10 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches: [ main, master ]
+    # 只在默认分支 main 和打 tag 时构建。
+    # 不监听 master：latest 标签用 enable={{is_default_branch}} 限定默认分支，
+    # 从 master 触发时没有任何可用标签，构建会必然失败（纯噪音）。
+    branches: [ main ]
     tags: [ 'v*' ]
   workflow_dispatch:
 
