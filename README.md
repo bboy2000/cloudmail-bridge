@@ -467,17 +467,30 @@ bash uninstall.sh             # 确认无误后实际卸载
 
 ### 手动卸载（不想用脚本）
 
+在**安装目录的上一级**执行，四条命令即可：
+
 ```bash
-cd 你的安装目录
-docker compose down                    # 停并删容器
-docker rmi cloud-mail-bridge-cloudmail-bridge:latest   # 删镜像
+# 1. 删容器（按名删除，不需要进目录）
+docker rm -f cloudmail-bridge
 
-# 注销证书续期（域名换成你自己的；不加会每天 cron 报错）
+# 2. 删镜像
+docker rmi cloud-mail-bridge-cloudmail-bridge:latest
+
+# 3. 注销证书续期（域名换成你申请证书时填的那个）
+#    只删文件不注销的话，cron 每天都会尝试续期失败并写日志
 ~/.acme.sh/acme.sh --remove -d mail.example.com --ecc
-crontab -l | grep -v acme.sh | crontab -   # 仅当没有其他证书时
 
-sudo rm -rf 你的安装目录                # data/ 是 root 写的，需要 sudo
+# 4. 删目录（data/ 由容器以 root 写入，需要 sudo）
+#    注意：不能在目录内部删它自己，务必先 cd 到上一级
+sudo rm -rf cloudmail-bridge
 ```
+
+几点说明：
+
+- 第 4 步用的是相对路径，前提是你当前就在它的上一级。想更保险可写完整路径。
+- 如果你给同一个目录签过多张证书（例如 `cm.example.com` 和 `mail.example.com`），第 3 步要对每个域名都执行一次。
+- **不要随手执行 `crontab -l | grep -v acme.sh | crontab -`**：那会清掉机器上所有 acme.sh 续期任务，别的域名的证书会就此静默失效。确认 `~/.acme.sh/acme.sh --list` 已经没有其他证书了，再执行这条。
+- 容器名不确定的话，用 `docker ps -a | grep cloudmail` 查。
 
 ---
 
