@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -18,6 +20,7 @@ type storedMessage struct {
 	flags     []imap.Flag
 	date      time.Time
 	seen      bool
+	deleted   bool // 客户端已标记 \Deleted，等待 EXPUNGE
 	hasAttach bool // raw 里已包含附件（避免同步时重复下载）
 }
 
@@ -61,12 +64,21 @@ func (s *mailStore) findMessageLocked(user, mailbox string, emailID int64) *stor
 
 // mailStore 全局内存存储：按 用户 -> 邮箱文件夹 -> 邮件列表 组织。
 type mailStore struct {
-	mu            sync.RWMutex
-	data          map[string]map[string][]*storedMessage
-	knownIDs      map[string]map[int64]bool // user -> emailId -> 是否已入库（去重）
-	onNewMail     func(user string, m *storedMessage)
-	onSeenChange  func(user string, emailID int64, seen bool) // 已读标记变更回调（回写 cloud-mail）
-	sentSeq       imap.UID // 本地发出邮件的 UID 序列（高位段，避免和 emailId 冲突）
+	mu           sync.RWMutex
+	data         map[string]map[string][]*storedMessage
+	knownIDs     map[string]map[int64]bool // user -> emailId -> 是否已入库（去重）
+	onNewMail    func(user string, m *storedMessage)
+	onSeenChange func(user string, emailID int64, seen bool) // 已读标记变更回调（回写 cloud-mail）
+	onDelete     func(user string, emailIDs []int64)         // 删除回调（可选扩展，默认不启用）
+	onRestore    func(user string)                           // 恢复回调：清空已删记录后触发全量重新同步
+	sentSeq      imap.UID                                    // 本地发出邮件的 UID 序列（高位段，避免和 emailId 冲突）
+
+	// 已删除集合（持久化）：user -> emailId -> true。
+	// 作用：云端同步若仍返回该邮件（站点侧"同步删除"未开启、或删除接口只是标记），
+	// 网关据此跳过，避免客户端删掉的邮件刷新后又回来。重启后从磁盘恢复。
+	deletedIDs  map[string]map[int64]bool
+	deletedMu   sync.RWMutex
+	deletedPath string // 已删集合落盘路径，空=不持久化
 
 	// IDLE 订阅：user -> 一组订阅者（每个 IDLE 的 session 一个 channel）
 	idleMu   sync.Mutex
@@ -80,9 +92,10 @@ var knownMailboxes = []string{"INBOX", "Sent", "Drafts", "Trash", "Junk"}
 
 func newMailStore() *mailStore {
 	s := &mailStore{
-		data:     make(map[string]map[string][]*storedMessage),
-		knownIDs: make(map[string]map[int64]bool),
-		idleSubs: make(map[string]map[chan struct{}]struct{}),
+		data:       make(map[string]map[string][]*storedMessage),
+		knownIDs:   make(map[string]map[int64]bool),
+		deletedIDs: make(map[string]map[int64]bool),
+		idleSubs:   make(map[string]map[chan struct{}]struct{}),
 	}
 	for _, u := range []string{""} {
 		s.ensureUser(u)
@@ -128,10 +141,16 @@ func (s *mailStore) ensureUser(user string) {
 		for _, mb := range knownMailboxes {
 			s.data[user][mb] = []*storedMessage{}
 		}
+		// Restore 已移除：不再创建虚拟文件夹。
 	}
 	if _, ok := s.knownIDs[user]; !ok {
 		s.knownIDs[user] = make(map[int64]bool)
 	}
+	s.deletedMu.Lock()
+	if _, ok := s.deletedIDs[user]; !ok {
+		s.deletedIDs[user] = make(map[int64]bool)
+	}
+	s.deletedMu.Unlock()
 }
 
 // messages 返回某用户某文件夹的邮件（只读快照指针，调用方需在外层持锁或只读）。
@@ -151,6 +170,11 @@ func (s *mailStore) addReceived(user string, items []emailItem, domain string, u
 
 	added := 0
 	for _, item := range items {
+		// 云端标记已删（isDel=1）或用户在本网关删过：一律不入库。
+		// 这是"客户端删掉后刷新又回来"的关键防线之一。
+		if item.IsDel == 1 || s.isDeletedID(user, item.EmailID) {
+			continue
+		}
 		ready := attachmentsReady(item)
 		if s.knownIDs[user][item.EmailID] {
 			// 已入库但上次没拿到附件：这次补齐后重建 raw，让客户端可见附件。
@@ -248,12 +272,254 @@ func (s *mailStore) applyUnread(user string, unreadMap map[int64]bool) {
 			if want {
 				m.flags = append(m.flags, imap.FlagSeen)
 			}
+			if m.deleted {
+				m.flags = append(m.flags, imap.FlagDeleted)
+			}
 			changed++
 		}
 	}
 	if changed > 0 {
 		log.Printf("[store] user=%s unread 校正 %d 封", user, changed)
 	}
+}
+
+// ============ 删除支持（IMAP \Deleted + EXPUNGE）============
+
+// reflagLocked 按 seen/deleted 重算 flags。调用方须持 s.mu。
+func (m *storedMessage) reflagLocked() {
+	m.flags = []imap.Flag{}
+	if m.seen {
+		m.flags = append(m.flags, imap.FlagSeen)
+	}
+	if m.deleted {
+		m.flags = append(m.flags, imap.FlagDeleted)
+	}
+}
+
+// setDeleted 处理 IMAP STORE \Deleted / -\Deleted。
+// 标记删除时立刻把 emailId 记入已删集合（持久化），这样即使客户端不发 EXPUNGE，
+// 下次同步也不会把邮件再拉回来。
+func (s *mailStore) setDeleted(user, mailbox string, uid imap.UID, deleted bool) {
+	s.mu.Lock()
+	var target *storedMessage
+	for _, m := range s.data[user][mailbox] {
+		if m.uid == uid {
+			target = m
+			break
+		}
+	}
+	if target == nil {
+		s.mu.Unlock()
+		return
+	}
+	if target.deleted == deleted {
+		s.mu.Unlock()
+		return
+	}
+	target.deleted = deleted
+	target.reflagLocked()
+	emailID := target.emailID
+	isReal := mailbox == "INBOX" && uid < sentUIDBase && emailID > 0
+	s.mu.Unlock()
+
+	if !isReal {
+		return
+	}
+	if deleted {
+		s.addDeletedID(user, emailID)
+		// 可选扩展点：若将来要「客户端删 = 服务器也删」，在这里接 onDelete。
+		// 当前默认不设置 onDelete —— 只在客户端/网关侧删除，不动 cloud-mail 服务器。
+		if s.onDelete != nil {
+			go s.onDelete(user, []int64{emailID})
+		}
+		log.Printf("[store] user=%s emailId=%d 标记 \\Deleted（已记入已删集合，同步时跳过；服务器邮件不变）", user, emailID)
+	} else {
+		s.removeDeletedID(user, emailID)
+		log.Printf("[store] user=%s emailId=%d 取消 \\Deleted（已从已删集合移除）", user, emailID)
+	}
+}
+
+// expungeDeleted 从本地移除已标记 \Deleted 的邮件。
+// 返回被移除邮件的序号（降序，供 IMAP EXPUNGE 通知用）和需要云端删除的 emailId。
+// 降序很重要：按从大到小通知，前面邮件的序号才不会被删除操作影响。
+func (s *mailStore) expungeDeleted(user, mailbox string) (seqNums []uint32, realIDs []int64) {
+	s.mu.Lock()
+	msgs := s.data[user][mailbox]
+	kept := make([]*storedMessage, 0, len(msgs))
+	// 从头到尾遍历收集，最后反转成降序
+	for i, m := range msgs {
+		if !m.deleted {
+			kept = append(kept, m)
+			continue
+		}
+		seqNums = append(seqNums, uint32(i+1))
+		if mailbox == "INBOX" && m.uid < sentUIDBase && m.emailID > 0 {
+			realIDs = append(realIDs, m.emailID)
+			delete(s.knownIDs[user], m.emailID)
+		}
+	}
+	removed := len(seqNums)
+	s.data[user][mailbox] = kept
+	s.mu.Unlock()
+
+	// 反转成降序
+	for i, j := 0, len(seqNums)-1; i < j; i, j = i+1, j-1 {
+		seqNums[i], seqNums[j] = seqNums[j], seqNums[i]
+	}
+
+	for _, id := range realIDs {
+		s.addDeletedID(user, id)
+	}
+	if removed > 0 {
+		log.Printf("[store] user=%s EXPUNGE %s 移除 %d 封", user, mailbox, removed)
+		if len(realIDs) > 0 && s.onDelete != nil {
+			go s.onDelete(user, realIDs)
+		}
+		go s.notifyIdle(user)
+	}
+	return seqNums, realIDs
+}
+
+// addDeletedID 把 emailId 记入已删集合并落盘。
+func (s *mailStore) addDeletedID(user string, emailID int64) {
+	s.deletedMu.Lock()
+	if s.deletedIDs[user] == nil {
+		s.deletedIDs[user] = make(map[int64]bool)
+	}
+	already := s.deletedIDs[user][emailID]
+	s.deletedIDs[user][emailID] = true
+	s.deletedMu.Unlock()
+	if !already {
+		s.saveDeleted()
+	}
+}
+
+// removeDeletedID 从已删集合移除（客户端取消删除标记时）。
+func (s *mailStore) removeDeletedID(user string, emailID int64) {
+	s.deletedMu.Lock()
+	if m := s.deletedIDs[user]; m != nil && m[emailID] {
+		delete(m, emailID)
+		s.deletedMu.Unlock()
+		s.saveDeleted()
+		return
+	}
+	s.deletedMu.Unlock()
+}
+
+// isDeletedID 判断某 emailId 是否已被用户删除。
+func (s *mailStore) isDeletedID(user string, emailID int64) bool {
+	s.deletedMu.RLock()
+	defer s.deletedMu.RUnlock()
+	return s.deletedIDs[user][emailID]
+}
+
+// deletedCount 返回该用户被客户端删掉的邮件数。
+func (s *mailStore) deletedCount(user string) int {
+	s.deletedMu.RLock()
+	defer s.deletedMu.RUnlock()
+	return len(s.deletedIDs[user])
+}
+
+// restoreAll 供「客户端主动请求下载全部邮件」时调用。
+// IMAP 没有"下载全部"这个命令，客户端（如网易邮箱大师的「收取历史邮件」）
+// 实际发出的是 UID FETCH 1:* 且请求整封正文（BODY[]）——覆盖全部邮件。
+// 网关收到这种请求即视为用户要"全部邮件"，此时：
+//  1. 清空该用户的已删记录（被删的邮件重新可见）
+//  2. 触发一次全量同步，把之前被跳过/删掉的邮件从服务器重新拉回来
+//
+// 注意：不清空现有缓存，避免当前这轮 FETCH 返回空列表让客户端看到"邮件全没了"。
+// 只影响网关本地状态，服务器上的邮件自始至终没有被动过。
+func (s *mailStore) restoreAll(user string) {
+	// 先取出要恢复的 id，再清空集合。
+	s.deletedMu.Lock()
+	ids := make([]int64, 0, len(s.deletedIDs[user]))
+	for id := range s.deletedIDs[user] {
+		ids = append(ids, id)
+	}
+	s.deletedIDs[user] = make(map[int64]bool)
+	s.deletedMu.Unlock()
+	s.saveDeleted()
+
+	// 从去重表里移除这些 id，让下次同步重新拉取它们。
+	s.mu.Lock()
+	for _, id := range ids {
+		delete(s.knownIDs[user], id)
+	}
+	s.mu.Unlock()
+
+	log.Printf("[restore] user=%s 客户端请求下载全部邮件：已清空已删记录(%d 条)，开始重新拉取", user, len(ids))
+
+	if s.onRestore != nil {
+		s.onRestore(user)
+	}
+	go s.notifyIdle(user)
+}
+
+// saveDeleted 把已删集合原子落盘（先写临时文件再 rename）。
+// 不落盘的话，网关重启后已删集合清空，客户端删掉的邮件会从云端重新拉回来。
+func (s *mailStore) saveDeleted() {
+	if s.deletedPath == "" {
+		return
+	}
+	s.deletedMu.RLock()
+	snapshot := make(map[string][]int64, len(s.deletedIDs))
+	for u, set := range s.deletedIDs {
+		if len(set) == 0 {
+			continue
+		}
+		ids := make([]int64, 0, len(set))
+		for id := range set {
+			ids = append(ids, id)
+		}
+		snapshot[u] = ids
+	}
+	s.deletedMu.RUnlock()
+
+	b, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		log.Printf("[store] 序列化已删集合失败: %v", err)
+		return
+	}
+	tmp := s.deletedPath + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		log.Printf("[store] 写已删集合失败: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, s.deletedPath); err != nil {
+		log.Printf("[store] 替换已删集合失败: %v", err)
+	}
+}
+
+// loadDeleted 从磁盘恢复已删集合。文件不存在视为空，正常启动。
+func (s *mailStore) loadDeleted() {
+	if s.deletedPath == "" {
+		return
+	}
+	b, err := os.ReadFile(s.deletedPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[store] 读已删集合失败: %v", err)
+		}
+		return
+	}
+	var raw map[string][]int64
+	if err := json.Unmarshal(b, &raw); err != nil {
+		log.Printf("[store] 解析已删集合失败（按空处理）: %v", err)
+		return
+	}
+	s.deletedMu.Lock()
+	total := 0
+	for u, ids := range raw {
+		if s.deletedIDs[u] == nil {
+			s.deletedIDs[u] = make(map[int64]bool)
+		}
+		for _, id := range ids {
+			s.deletedIDs[u][id] = true
+			total++
+		}
+	}
+	s.deletedMu.Unlock()
+	log.Printf("[store] 已删集合已恢复：%d 个用户 / 共 %d 条", len(raw), total)
 }
 
 // addSent 把 SMTP 发出的邮件写入本地 Sent 文件夹（供 IMAP 客户端「已发送」可见）。
@@ -287,6 +553,9 @@ func (s *mailStore) addSentFromCloud(user string, items []emailItem, domain stri
 	s.ensureUser(user)
 	added := 0
 	for _, item := range items {
+		if item.IsDel == 1 || s.isDeletedID(user, item.EmailID) {
+			continue
+		}
 		ready := attachmentsReady(item)
 		if s.knownIDs[user][item.EmailID] {
 			if ready {

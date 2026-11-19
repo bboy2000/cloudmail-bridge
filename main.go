@@ -30,6 +30,7 @@ type session struct {
 	selected string
 	closed   bool
 	active   bool // 该会话是否已计入 auth 的在线计数
+	restored bool // 本连接是否已处理过"下载全部邮件"请求，避免重复触发
 }
 
 func (s *session) Close() error {
@@ -174,8 +175,23 @@ func (s *session) Idle(w *imapserver.UpdateWriter, stop <-chan struct{}) error {
 		}
 	}
 }
-func (s *session) Unselect() error                                          { s.selected = ""; return nil }
-func (s *session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error { return nil }
+func (s *session) Unselect() error { s.selected = ""; return nil }
+
+// Expunge 移除已标记 \Deleted 的邮件（同时回写云端删除）。
+// 之前这里是空实现，导致客户端删掉的邮件在下次同步时又从云端拉回来。
+// uids 非 nil 时只处理这些 UID（UID EXPUNGE 扩展）。
+func (s *session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
+	if s.selected == "" {
+		return nil
+	}
+	seqNums, _ := s.store.expungeDeleted(s.user, s.selected)
+	for _, seq := range seqNums {
+		if err := w.WriteExpunge(seq); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
 	msgs := s.store.messages(s.user, s.selected)
@@ -209,8 +225,74 @@ func matchCriteria(m *storedMessage, criteria *imap.SearchCriteria) bool {
 	return true
 }
 
+// fetchAllRequested 判断这是否是"客户端请求下载全部邮件"。
+// 判据：请求整封正文（BODY[] / BODY.PEEK[]，无 part 前缀）且范围覆盖全部邮件。
+// 只看 FLAGS/UID/头部的常规同步不会被误判，所以不会把删掉的邮件又冒出来。
+func fetchAllRequested(numSet imap.NumSet, options *imap.FetchOptions, msgs []*storedMessage) bool {
+	wholeBody := false
+	for _, bs := range options.BodySection {
+		if len(bs.Part) == 0 && bs.Specifier == imap.PartSpecifierNone {
+			wholeBody = true
+			break
+		}
+	}
+	if !wholeBody {
+		return false
+	}
+
+	// IMAP 里 Stop==0 表示 "*"。`1:*` 这种从 1 到底的开放区间即"全部邮件"，
+	// 即使本地当前一封都没有（全被删了）也能识别。
+	switch ns := numSet.(type) {
+	case imap.UIDSet:
+		for _, r := range ns {
+			if r.Start <= 1 && r.Stop == 0 {
+				return true
+			}
+		}
+	case imap.SeqSet:
+		for _, r := range ns {
+			if r.Start <= 1 && r.Stop == 0 {
+				return true
+			}
+		}
+	}
+
+	// 退一步：范围确实覆盖了本地所有邮件也算。
+	if len(msgs) == 0 {
+		return false
+	}
+	for i, m := range msgs {
+		seq := uint32(i + 1)
+		switch ns := numSet.(type) {
+		case imap.SeqSet:
+			if !ns.Contains(seq) {
+				return false
+			}
+		case imap.UIDSet:
+			if !ns.Contains(m.uid) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
 	msgs := s.store.messages(s.user, s.selected)
+
+	// 客户端点了"收取历史邮件 / 下载全部邮件"时，会发覆盖全部邮件的正文拉取请求。
+	// 这时把已删记录清空并重新拉取，让被删掉的邮件重新出现。
+	// 每个连接只处理一次，避免客户端反复遍历时重复触发同步。
+	if !s.restored && s.selected == "INBOX" && fetchAllRequested(numSet, options, msgs) {
+		if n := s.store.deletedCount(s.user); n > 0 {
+			s.restored = true
+			log.Printf("[fetch] user=%s 检测到「下载全部邮件」请求（已删 %d 封）-> 恢复", s.user, n)
+			s.store.restoreAll(s.user)
+		}
+	}
+
 	for i, m := range msgs {
 		seq := uint32(i + 1)
 		var matched bool
@@ -290,6 +372,14 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 					s.store.setSeen(s.user, s.selected, m.uid, true)
 				case imap.StoreFlagsDel:
 					s.store.setSeen(s.user, s.selected, m.uid, false)
+				}
+			}
+			if f == imap.FlagDeleted {
+				switch flags.Op {
+				case imap.StoreFlagsAdd:
+					s.store.setDeleted(s.user, s.selected, m.uid, true)
+				case imap.StoreFlagsDel:
+					s.store.setDeleted(s.user, s.selected, m.uid, false)
 				}
 			}
 		}
@@ -394,6 +484,34 @@ func main() {
 			log.Printf("[readback] user=%s emailId=%d OK", user, emailID)
 		}
 	}
+
+	// 删除：只在本网关/客户端侧生效，**不删除 cloud-mail 服务器上的邮件**。
+	// 做法：把 emailId 记入已删集合（落盘持久化），同步时跳过，客户端刷新不再重新下载。
+	// 网页版和服务器上的邮件保持原样，不受影响。
+	// 注意：这里故意不设置 store.onDelete —— 不调用 DELETE /api/email/delete。
+	store.onDelete = nil
+
+	// 恢复：客户端删掉 Restore 文件夹里那封说明邮件后，立刻强制全量重新同步。
+	store.onRestore = func(user string) {
+		cl, err := auth.clientFor(user)
+		if err != nil {
+			log.Printf("[restore] user=%s 无法恢复：%v", user, err)
+			return
+		}
+		if err := auth.syncUser(user, cl, true); err != nil {
+			log.Printf("[restore] user=%s 全量同步失败：%v", user, err)
+			return
+		}
+		log.Printf("[restore] user=%s 全量重新下载完成", user)
+	}
+
+	// 已删集合落盘：/app/data 由 compose 挂载到宿主机，容器重建后不再把删掉的邮件拉回来。
+	store.deletedPath = "data/deleted-ids.json"
+	if err := os.MkdirAll("data", 0o755); err != nil {
+		log.Printf("[store] 创建 data 目录失败: %v（已删集合将不持久化）", err)
+		store.deletedPath = ""
+	}
+	store.loadDeleted()
 
 	// 查询 cloud-mail 收件 unread 状态（验证已读回写）
 	if *testRead {

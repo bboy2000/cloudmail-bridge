@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -274,6 +275,63 @@ func (c *cloudMailClient) markRead(emailIDs []int64) error {
 		return nil
 	}
 	return fmt.Errorf("PUT /api/email/read failed after 5 attempts: %w", lastErr)
+}
+
+// ========== 删除邮件（预留，当前不启用）==========
+//
+// 说明：本网关的删除语义是「只在客户端/网关侧删除，不动 cloud-mail 服务器上的邮件」。
+// 因此正常流程不会调用本函数；仅在此后需要「删客户端 = 删服务器」时才接上。
+// 若启用，需在 main.go 设置 store.onDelete 回调。
+
+// deleteEmails 删除邮件。严格按文档 #5：DELETE /api/email/delete?emailIds=1,2
+// 文档原文："删除当前用户的邮件。默认标记删除，系统开启同步删除时为永久删除"
+func (c *cloudMailClient) deleteEmails(emailIDs []int64) error {
+	if len(emailIDs) == 0 {
+		return nil
+	}
+	if err := c.ensureJWT(); err != nil {
+		return err
+	}
+	ids := make([]string, 0, len(emailIDs))
+	for _, id := range emailIDs {
+		ids = append(ids, strconv.FormatInt(id, 10))
+	}
+	path := "/api/email/delete?emailIds=" + url.QueryEscape(strings.Join(ids, ","))
+
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		req, err := c.authedRequest(http.MethodDelete, path, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+			continue
+		}
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		var ar apiResponse
+		if err := json.Unmarshal(respBody, &ar); err != nil {
+			return fmt.Errorf("delete bad JSON: %w (body=%s)", err, string(respBody))
+		}
+		if ar.Code == 401 {
+			if _, e := c.login(); e != nil {
+				return fmt.Errorf("JWT expired and relogin failed: %w", e)
+			}
+			continue
+		}
+		if ar.Code != 200 {
+			return fmt.Errorf("delete error code=%d msg=%s", ar.Code, ar.Message)
+		}
+		return nil
+	}
+	return fmt.Errorf("DELETE /api/email/delete failed after 5 attempts: %w", lastErr)
 }
 
 // getEmailListPage 带重试的 GET /api/email/list 单页查询（JWT 鉴权）。

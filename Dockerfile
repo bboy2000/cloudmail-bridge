@@ -17,6 +17,8 @@ LABEL org.opencontainers.image.title="cloudmail-bridge" \
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=builder /out/cloudmail-bridge /app/cloudmail-bridge
+# 记录客户端已删除的邮件 ID，需挂载到宿主机持久化，否则容器重建后会把删掉的邮件重新下载
+RUN mkdir -p /app/data
 ENV TZ=Asia/Shanghai
 EXPOSE 993 465
 ENTRYPOINT ["/app/cloudmail-bridge"]

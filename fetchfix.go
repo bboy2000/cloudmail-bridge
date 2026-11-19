@@ -10,7 +10,6 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/mail"
-	"strconv"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
@@ -193,53 +192,78 @@ func readAll(p *multipart.Part) ([]byte, error) {
 	return b.Bytes(), err
 }
 
-// bodyStructureOf 为我们的邮件（multipart/alternative: text/plain + text/html）
-// 构造 BODYSTRUCTURE。用 net/mail + multipart 解析真实分片，保证结构准确。
+// bodyStructureOf 递归解析整封 RFC822，构造准确的 BODYSTRUCTURE。
+// 两个关键点（否则客户端附件展示会出错）：
+//  1. multipart 必须递归成 BodyStructureMultiPart，不能再把内层容器
+//     （如正文的 multipart/alternative）当成 single part 报出去——
+//     否则客户端会把这个容器当成一个"未命名附件"。
+//  2. 附件 part 必须带 Content-Disposition: attachment + filename，
+//     客户端据此识别附件并取文件名；缺失会导致有的客户端看不到附件。
 func bodyStructureOf(raw []byte) imap.BodyStructure {
 	header, body := splitHeaderBody(raw)
 	ct := headerValue(header, "Content-Type")
 	mediaType, params, err := mime.ParseMediaType(ct)
-	if err != nil {
-		return &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Size: uint32(len(body)), Encoding: headerValue(header, "Content-Transfer-Encoding"), Extended: &imap.BodyStructureSinglePartExt{}}
+	if err != nil || strings.TrimSpace(ct) == "" {
+		mediaType = "text/plain"
+		params = nil
 	}
-	if !strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
-		return singlePartStructure(mediaType, params, headerValue(header, "Content-Transfer-Encoding"), body)
-	}
-
-	boundary := params["boundary"]
-	subtype := "mixed"
-	if i := strings.IndexByte(mediaType, '/'); i >= 0 {
-		subtype = mediaType[i+1:]
-	}
-	mr := multipart.NewReader(bytes.NewReader(body), boundary)
-	var children []imap.BodyStructure
-	for {
-		p, err := mr.NextPart()
-		if err != nil {
-			break
-		}
-		data, _ := readAll(p)
-		childCT := p.Header.Get("Content-Type")
-		childType, childParams, e := mime.ParseMediaType(childCT)
-		if e != nil {
-			childType, childParams = "text/plain", map[string]string{"charset": "utf-8"}
-		}
-		childEncoding := strings.TrimSpace(p.Header.Get("Content-Transfer-Encoding"))
-		children = append(children, singlePartStructure(childType, childParams, childEncoding, data))
-	}
-	if len(children) == 0 {
-		children = []imap.BodyStructure{
-			&imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Size: 0, Encoding: "7bit", Extended: &imap.BodyStructureSinglePartExt{}},
-		}
-	}
-	return &imap.BodyStructureMultiPart{
-		Children: children,
-		Subtype:  subtype,
-		Extended: &imap.BodyStructureMultiPartExt{Params: params},
-	}
+	return partStructure(mediaType, params, header, body)
 }
 
-func singlePartStructure(mediaType string, params map[string]string, encoding string, body []byte) *imap.BodyStructureSinglePart {
+// partStructure 解析单个 MIME part；遇到 multipart/* 递归解析子 part。
+// partHeader 是该 part 自己的 MIME 头字节（含结尾空行），用于取 CTE / Disposition。
+func partStructure(mediaType string, params map[string]string, partHeader, body []byte) imap.BodyStructure {
+	if strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+		subtype := "mixed"
+		if i := strings.IndexByte(mediaType, '/'); i >= 0 {
+			subtype = mediaType[i+1:]
+		}
+		boundary := params["boundary"]
+		children := []imap.BodyStructure{}
+		if boundary != "" {
+			mr := multipart.NewReader(bytes.NewReader(body), boundary)
+			for {
+				p, err := mr.NextPart()
+				if err != nil {
+					break
+				}
+				data, _ := readAll(p)
+				childCT := p.Header.Get("Content-Type")
+				childType, childParams, e := mime.ParseMediaType(childCT)
+				if e != nil {
+					childType, childParams = "text/plain", map[string]string{"charset": "utf-8"}
+				}
+				children = append(children, partStructure(childType, childParams, partHeaderBytes(p.Header), data))
+			}
+		}
+		if len(children) == 0 {
+			children = []imap.BodyStructure{
+				&imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Size: 0, Encoding: "7bit", Extended: &imap.BodyStructureSinglePartExt{}},
+			}
+		}
+		return &imap.BodyStructureMultiPart{
+			Children: children,
+			Subtype:  subtype,
+			Extended: &imap.BodyStructureMultiPartExt{Params: params},
+		}
+	}
+	return singlePartStructure(mediaType, params, headerValue(partHeader, "Content-Transfer-Encoding"), body, partHeader)
+}
+
+// partHeaderBytes 把 multipart.Part 的 MIME 头重建为"头+结尾空行"字节，
+// 供 headerValue 复用。header key 用 textproto 的规范形式写出。
+func partHeaderBytes(h map[string][]string) []byte {
+	var b bytes.Buffer
+	for k, vals := range h {
+		for _, v := range vals {
+			b.WriteString(k + ": " + v + "\r\n")
+		}
+	}
+	b.WriteString("\r\n")
+	return b.Bytes()
+}
+
+func singlePartStructure(mediaType string, params map[string]string, encoding string, body []byte, partHeader []byte) *imap.BodyStructureSinglePart {
 	typ, subtype := "text", "plain"
 	if mediaType != "" {
 		if i := strings.IndexByte(mediaType, '/'); i >= 0 {
@@ -254,19 +278,25 @@ func singlePartStructure(mediaType string, params map[string]string, encoding st
 	if encoding == "" {
 		encoding = "7bit"
 	}
+	ext := &imap.BodyStructureSinglePartExt{}
+	// 关键：从 Content-Disposition 解析出 attachment + filename 并带进
+	// BODYSTRUCTURE。go-imap 的 Filename() 优先读 Disposition.Params["filename"]，
+	// 客户端（网易邮箱大师等）据此识别附件、显示文件名。
+	if disp := headerValue(partHeader, "Content-Disposition"); disp != "" {
+		if dv, dparams, e := mime.ParseMediaType(disp); e == nil && dv != "" {
+			ext.Disposition = &imap.BodyStructureDisposition{Value: dv, Params: dparams}
+		}
+	}
 	bs := &imap.BodyStructureSinglePart{
 		Type:     typ,
 		Subtype:  subtype,
 		Params:   params,
 		Encoding: encoding,
 		Size:     uint32(len(body)),
-		Extended: &imap.BodyStructureSinglePartExt{},
+		Extended: ext,
 	}
 	if strings.EqualFold(typ, "text") {
 		bs.Text = &imap.BodyStructureText{NumLines: int64(bytes.Count(body, []byte("\n")))}
 	}
 	return bs
 }
-
-// 防止 strconv 未使用的占位（避免编译错误）
-var _ = strconv.Itoa
