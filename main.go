@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"os"
 	"os/signal"
@@ -198,7 +199,7 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	var seqs []uint32
 	var uids []imap.UID
 	for i, m := range msgs {
-		if !matchCriteria(m, criteria) {
+		if !matchCriteria(m, uint32(i+1), criteria) {
 			continue
 		}
 		seqs = append(seqs, uint32(i+1))
@@ -210,19 +211,104 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	return &imap.SearchData{All: imap.SeqSetNum(seqs...)}, nil
 }
 
-func matchCriteria(m *storedMessage, criteria *imap.SearchCriteria) bool {
+// hasFlag 判断邮件是否带有某个 IMAP 标志。
+// 网关只跟踪 \Seen 与 \Deleted；其余（\Answered、\Flagged、\Draft、\Recent）
+// 一律视为未设置——不跟踪的标志如果谎报为已设置，客户端会显示一个存不住的状态。
+func (m *storedMessage) hasFlag(f imap.Flag) bool {
+	switch f {
+	case imap.FlagSeen:
+		return m.seen
+	case imap.FlagDeleted:
+		return m.deleted
+	default:
+		return false
+	}
+}
+
+// dateOnly 把时间截断到"当天零点"，用于 SINCE/BEFORE 的比较（IMAP 按天比较）。
+func dateOnly(t time.Time) time.Time {
+	y, mo, d := t.Date()
+	return time.Date(y, mo, d, 0, 0, 0, 0, t.Location())
+}
+
+// matchCriteria 判断某封邮件是否命中 SEARCH 条件。
+//
+// 已支持：标志（SEEN/UNSEEN、DELETED/UNDELETED 等）、SINCE/BEFORE、
+// LARGER/SMALLER、UID/序号集合、头部字段搜索（SUBJECT/FROM/TO 等）。
+// 未支持：BODY、TEXT、KEYWORD、NOT、OR —— 这些条件会被忽略（宁可多返回，
+// 不会漏掉邮件），且不影响上面已支持的条件生效。
+func matchCriteria(m *storedMessage, seq uint32, criteria *imap.SearchCriteria) bool {
 	if criteria == nil {
 		return true
 	}
-	if len(criteria.Flag) > 0 {
-		for _, f := range criteria.Flag {
-			want := f == imap.FlagSeen
-			if m.seen != want {
-				return false
-			}
+
+	// 标志：要求同时满足 criteria.Flag 里的每一个，且都不满足 NotFlag 里的。
+	// 注意 UNSEEN 在库中被解析为 NotFlag=[\Seen]，不是 Flag。
+	for _, f := range criteria.Flag {
+		if !m.hasFlag(f) {
+			return false
 		}
 	}
+	for _, f := range criteria.NotFlag {
+		if m.hasFlag(f) {
+			return false
+		}
+	}
+
+	// 日期：按天比较，忽略时分秒
+	if !criteria.Since.IsZero() && m.date.Before(dateOnly(criteria.Since)) {
+		return false
+	}
+	if !criteria.Before.IsZero() && !m.date.Before(dateOnly(criteria.Before)) {
+		return false
+	}
+
+	// 大小（整封 raw 的字节数）
+	if criteria.Larger > 0 && int64(len(m.raw)) <= criteria.Larger {
+		return false
+	}
+	if criteria.Smaller > 0 && int64(len(m.raw)) >= criteria.Smaller {
+		return false
+	}
+
+	// UID / 序号集合
+	for _, us := range criteria.UID {
+		if !us.Contains(m.uid) {
+			return false
+		}
+	}
+	for _, ss := range criteria.SeqNum {
+		if !ss.Contains(seq) {
+			return false
+		}
+	}
+
+	// 头部字段搜索（SEARCH SUBJECT xxx 会被库转成 Header{Key:"Subject"}）
+	// 主题/发件人常是 RFC2047 编码（如 =?utf-8?q?...?=），必须先解码再比较，
+	// 否则搜中文永远匹配不到。也保留一次对原始串的比对，兼容客户端传编码后的值。
+	for _, hf := range criteria.Header {
+		raw := parseHeader(m.raw, hf.Key+":")
+		val := decodeHeaderValue(raw)
+		needle := strings.ToLower(hf.Value)
+		if strings.Contains(strings.ToLower(val), needle) ||
+			strings.Contains(strings.ToLower(raw), needle) {
+			continue
+		}
+		return false
+	}
+
 	return true
+}
+
+// decodeHeaderValue 解码 RFC2047 编码的头部值；失败时原样返回。
+func decodeHeaderValue(s string) string {
+	if s == "" {
+		return s
+	}
+	if out, err := new(mime.WordDecoder).DecodeHeader(s); err == nil {
+		return out
+	}
+	return s
 }
 
 // fetchAllRequested 判断这是否是"客户端请求下载全部邮件"。
