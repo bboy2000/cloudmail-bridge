@@ -349,6 +349,81 @@ func (s *mailStore) setDeleted(user, mailbox string, uid imap.UID, deleted bool)
 	}
 }
 
+// setFlags 一次性把邮件的 seen/deleted 设为指定值（对应 IMAP STORE ... FLAGS (...) 覆盖式）。
+// 普通 STORE +FLAGS / -FLAGS 走 setSeen / setDeleted；只有覆盖式才用这里。
+// 副作用与那两个方法保持一致：seen 变化回写云端，deleted 变化维护已删集合。
+func (s *mailStore) setFlags(user, mailbox string, uid imap.UID, seen, deleted bool) {
+	s.mu.Lock()
+	var target *storedMessage
+	for _, m := range s.data[user][mailbox] {
+		if m.uid == uid {
+			target = m
+			break
+		}
+	}
+	if target == nil {
+		s.mu.Unlock()
+		return
+	}
+	seenChanged := target.seen != seen
+	deletedChanged := target.deleted != deleted
+	if !seenChanged && !deletedChanged {
+		s.mu.Unlock()
+		return
+	}
+	target.seen = seen
+	target.deleted = deleted
+	target.reflagLocked()
+	emailID := target.emailID
+	isReal := mailbox == "INBOX" && uid < sentUIDBase && emailID > 0
+	s.mu.Unlock()
+
+	if !isReal {
+		return
+	}
+	if seenChanged && s.onSeenChange != nil {
+		go s.onSeenChange(user, emailID, seen)
+	}
+	if deletedChanged {
+		if deleted {
+			s.addDeletedID(user, emailID)
+			if s.onDelete != nil {
+				go s.onDelete(user, []int64{emailID})
+			}
+			log.Printf("[store] user=%s emailId=%d 标记 \\Deleted（覆盖式 STORE）", user, emailID)
+		} else {
+			s.removeDeletedID(user, emailID)
+			log.Printf("[store] user=%s emailId=%d 取消 \\Deleted（覆盖式 STORE）", user, emailID)
+		}
+	}
+}
+
+// unseenCount 返回邮箱里未读邮件数（供 STATUS UNSEEN 用）。
+func (s *mailStore) unseenCount(user, mailbox string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for _, m := range s.data[user][mailbox] {
+		if !m.seen {
+			n++
+		}
+	}
+	return n
+}
+
+// deletedCountIn 返回邮箱里已标 \Deleted 但未 EXPUNGE 的邮件数（供 STATUS DELETED 用）。
+func (s *mailStore) deletedCountIn(user, mailbox string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for _, m := range s.data[user][mailbox] {
+		if m.deleted {
+			n++
+		}
+	}
+	return n
+}
+
 // expungeDeleted 从本地移除已标记 \Deleted 的邮件。
 // 返回被移除邮件的序号（降序，供 IMAP EXPUNGE 通知用）和需要云端删除的 emailId。
 // 降序很重要：按从大到小通知，前面邮件的序号才不会被删除操作影响。

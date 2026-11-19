@@ -86,9 +86,13 @@ func (s *session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 		}
 	}
 	log.Printf("SELECT %s user=%s: %d messages", mailbox, s.user, len(msgs))
+	// 只声明真正支持的标志。\Answered / \Flagged / \Draft 在 cloud-mail 侧没有
+	// 对应的写接口（星标是独立的 star 表，要额外查询会多耗 D1 额度），
+	// 若在此声明为可写，客户端会发 STORE 却存不住，点星标就会没反应。
+	// 不多承诺，客户端就不会显示这些操作入口。
 	return &imap.SelectData{
-		Flags:             []imap.Flag{imap.FlagSeen, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted, imap.FlagDraft},
-		PermanentFlags:    []imap.Flag{imap.FlagSeen, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted, imap.FlagDraft},
+		Flags:             []imap.Flag{imap.FlagSeen, imap.FlagDeleted},
+		PermanentFlags:    []imap.Flag{imap.FlagSeen, imap.FlagDeleted},
 		NumMessages:       uint32(len(msgs)),
 		FirstUnseenSeqNum: firstUnseen,
 		UIDNext:           nextUID(msgs),
@@ -144,7 +148,17 @@ func (s *session) Status(mailbox string, options *imap.StatusOptions) (*imap.Sta
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Mailbox not found"}
 	}
 	n := uint32(len(msgs))
-	return &imap.StatusData{Mailbox: mailbox, NumMessages: &n, UIDNext: nextUID(msgs), UIDValidity: 1}, nil
+	unseen := uint32(s.store.unseenCount(s.user, mailbox))
+	deleted := uint32(s.store.deletedCountIn(s.user, mailbox))
+	// 未读数要返回，否则客户端未读角标不准（之前恒为空，部分客户端显示全部未读）。
+	return &imap.StatusData{
+		Mailbox:     mailbox,
+		NumMessages: &n,
+		NumUnseen:   &unseen,
+		NumDeleted:  &deleted,
+		UIDNext:     nextUID(msgs),
+		UIDValidity: 1,
+	}, nil
 }
 
 func (s *session) Append(mailbox string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
@@ -477,21 +491,36 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 		if !matched {
 			continue
 		}
-		for _, f := range flags.Flags {
-			if f == imap.FlagSeen {
-				switch flags.Op {
-				case imap.StoreFlagsAdd:
-					s.store.setSeen(s.user, s.selected, m.uid, true)
-				case imap.StoreFlagsDel:
-					s.store.setSeen(s.user, s.selected, m.uid, false)
+		// 覆盖式 STORE n FLAGS (...) 语义是"把标志集合设为这些"，
+		// 未列出的标志要被清掉，所以不能复用 +FLAGS/-FLAGS 的逐项处理。
+		if flags.Op == imap.StoreFlagsSet {
+			seen, deleted := false, false
+			for _, f := range flags.Flags {
+				switch f {
+				case imap.FlagSeen:
+					seen = true
+				case imap.FlagDeleted:
+					deleted = true
 				}
 			}
-			if f == imap.FlagDeleted {
-				switch flags.Op {
-				case imap.StoreFlagsAdd:
-					s.store.setDeleted(s.user, s.selected, m.uid, true)
-				case imap.StoreFlagsDel:
-					s.store.setDeleted(s.user, s.selected, m.uid, false)
+			s.store.setFlags(s.user, s.selected, m.uid, seen, deleted)
+		} else {
+			for _, f := range flags.Flags {
+				if f == imap.FlagSeen {
+					switch flags.Op {
+					case imap.StoreFlagsAdd:
+						s.store.setSeen(s.user, s.selected, m.uid, true)
+					case imap.StoreFlagsDel:
+						s.store.setSeen(s.user, s.selected, m.uid, false)
+					}
+				}
+				if f == imap.FlagDeleted {
+					switch flags.Op {
+					case imap.StoreFlagsAdd:
+						s.store.setDeleted(s.user, s.selected, m.uid, true)
+					case imap.StoreFlagsDel:
+						s.store.setDeleted(s.user, s.selected, m.uid, false)
+					}
 				}
 			}
 		}
