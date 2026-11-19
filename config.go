@@ -9,14 +9,14 @@ import (
 
 // Config 网关配置。可用 config.json 或环境变量提供（环境变量优先）。
 type Config struct {
-	BaseURL        string   `json:"base_url"`          // cloud-mail 根地址，例如 https://example.com
-	ListenAddr     string   `json:"listen_addr"`       // IMAP 监听地址，默认 0.0.0.0:993
-	SMTPListenAddr string   `json:"smtp_listen_addr"`  // SMTP 监听地址，默认 0.0.0.0:465
-	Domain         string   `json:"domain"`            // 邮箱域名，用于生成 Message-ID
-	PollInterval   int      `json:"poll_interval"`     // 轮询间隔（秒）
+	BaseURL        string   `json:"base_url"`         // cloud-mail 根地址，例如 https://example.com
+	ListenAddr     string   `json:"listen_addr"`      // IMAP 监听地址，默认 0.0.0.0:993
+	SMTPListenAddr string   `json:"smtp_listen_addr"` // SMTP 监听地址，默认 0.0.0.0:465
+	Domain         string   `json:"domain"`           // 邮箱域名，用于生成 Message-ID
+	PollInterval   int      `json:"poll_interval"`    // 轮询间隔（秒）
 	PageSize       int      `json:"page_size"`        // 每页拉取条数
 	MaxPages       int      `json:"max_pages"`        // 最多拉几页，0=全量
-	InsecureAuth   bool     `json:"insecure_auth"`     // 允许明文认证
+	InsecureAuth   bool     `json:"insecure_auth"`    // 允许明文认证
 	TLSMode        string   `json:"tls_mode"`         // implicit / starttls / plain
 	CertFile       string   `json:"cert_file"`        // 证书链 fullchain.pem
 	KeyFile        string   `json:"key_file"`         // 私钥 key.pem
@@ -34,6 +34,14 @@ type Config struct {
 
 	JWTCacheTTL  int `json:"jwt_cache_ttl"` // JWT 缓存小时数
 	SyncInterval int `json:"sync_interval"` // 同一邮箱两次同步最小间隔（分钟）
+
+	// 增量探测：每轮先用 1 条 size=1&full=0 的请求看最新 emailId 有没有变，
+	// 没变就跳过该账号的全量拉取。能把每轮读取行数从"全部邮件"降到 1 行，
+	// 大幅节省 D1 读取额度。0 = 关闭（每轮都全量，兼容旧行为）。
+	ProbeEnabled bool `json:"probe_enabled"`
+	// 连续跳过多少轮后强制做一次全量。用于校正已读状态（网页版改了已读时，
+	// 只靠探测发现不了）。设 5 且轮询 60 秒 = 约 5 分钟校正一次。
+	ProbeForceFull int `json:"probe_force_full"`
 
 	// 附件下载地址前缀。留空 = 用 base_url + "/" + att.key（对应官方源码无 r2Domain 时的本站代理）。
 	// 若站点配置了 R2/S3 自定义域名，填该域名（不带尾部斜杠），例如 https://cdn.example.com
@@ -53,6 +61,8 @@ func defaultConfig() *Config {
 		TLSMode:        "plain",
 		JWTCacheTTL:    12,
 		SyncInterval:   2,
+		ProbeEnabled:   true,
+		ProbeForceFull: 5,
 	}
 }
 
@@ -97,6 +107,8 @@ func (c *Config) applyEnv() {
 	setInt(&c.PageSize, "PAGE_SIZE")
 	setInt(&c.MaxPages, "MAX_PAGES")
 	setInt(&c.JWTCacheTTL, "JWT_CACHE_TTL")
+	setBool(&c.ProbeEnabled, "PROBE_ENABLED")
+	setInt(&c.ProbeForceFull, "PROBE_FORCE_FULL")
 	setBool(&c.InsecureAuth, "INSECURE_AUTH")
 }
 

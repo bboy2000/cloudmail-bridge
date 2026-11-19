@@ -387,6 +387,20 @@ func (c *cloudMailClient) listInboxEmails(accountID int64, mailType, size int) (
 	return c.getEmailListPage(path)
 }
 
+// probeLatestEmailID 轻量探测：只取 1 封、不要正文（full=0），返回最新一封的 emailId。
+// 用于判断该账号该类型自上次同步以来有没有变化，避免每轮都全量拉取。
+// 默认按 emailId 倒序，所以第一封就是最新的。没邮件时返回 0。
+func (c *cloudMailClient) probeLatestEmailID(accountID int64, mailType int) (int64, error) {
+	items, err := c.listInboxEmails(accountID, mailType, 1)
+	if err != nil {
+		return 0, err
+	}
+	if len(items) == 0 {
+		return 0, nil
+	}
+	return items[0].EmailID, nil
+}
+
 // fetchAllEmailList 用 emailId 游标分页拉全量（type: 0收件 1发件）。
 // cloud-mail 文档：size 最大 50；emailId 游标 + timeSort=0 查更早。
 func (c *cloudMailClient) fetchAllEmailList(accountID int64, mailType int) ([]emailItem, error) {

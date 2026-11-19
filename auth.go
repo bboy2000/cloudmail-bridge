@@ -25,6 +25,10 @@ type authManager struct {
 	mu      sync.Mutex
 	entries map[string]*authEntry // 归一化邮箱 -> 缓存项
 
+	// 增量探测状态：key = "user|accountID|mailType"
+	// 由 mu 一起保护，无需单独加锁。
+	probes map[string]*probeState
+
 	ttl time.Duration
 }
 
@@ -33,6 +37,13 @@ type authEntry struct {
 	expiresAt time.Time
 	syncedAt  time.Time
 	active    int // 当前在线的客户端会话数（IMAP+SMTP），0 表示无人在线
+}
+
+// probeState 记录某个"账号+邮件类型"上次看到的最新 emailId，
+// 用于下一轮判断有没有新邮件，从而跳过全量拉取。
+type probeState struct {
+	latestID  int64 // 上次看到的最新 emailId
+	skipCount int   // 连续跳过的轮数（达到 ProbeForceFull 后强制全量）
 }
 
 // incActive / decActive 维护用户在线会话计数。
@@ -74,6 +85,7 @@ func newAuthManager(baseURL string, admin *cloudMailClient, cfg *Config, store *
 		cfg:     cfg,
 		store:   store,
 		entries: make(map[string]*authEntry),
+		probes:  make(map[string]*probeState),
 		ttl:     ttl,
 	}
 }
@@ -148,6 +160,55 @@ func (a *authManager) syncAll() {
 	}
 }
 
+// shouldSkipFullSync 用一次轻量探测（size=1）判断该账号该类型能否跳过全量拉取。
+// 返回 true 表示"没有新邮件，本轮跳过"，能省下大量 D1 读取。
+//
+// 判定规则：
+//   - 探测到的最新 emailId 与上轮相同 -> 没新邮件，跳过；
+//   - 但连续跳过达到 ProbeForceFull 轮后，强制做一次全量，
+//     用来同步网页版改动的已读状态（只靠探测发现不了已读变化）；
+//   - 探测请求失败 -> 不跳过（宁可多读也不能漏邮件）；
+//   - force=true（用户手动触发/登录首次）-> 永不跳过。
+func (a *authManager) shouldSkipFullSync(user string, c *cloudMailClient, accountID int64, mailType int, force bool) bool {
+	if force || !a.cfg.ProbeEnabled {
+		return false
+	}
+	latest, err := c.probeLatestEmailID(accountID, mailType)
+	if err != nil {
+		log.Printf("[probe] %s accountId=%d type=%d 探测失败，回退全量：%v", user, accountID, mailType, err)
+		return false
+	}
+
+	key := fmt.Sprintf("%s|%d|%d", user, accountID, mailType)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	st := a.probes[key]
+	if st == nil {
+		st = &probeState{}
+		a.probes[key] = st
+	}
+
+	forceFull := a.cfg.ProbeForceFull
+	if forceFull <= 0 {
+		forceFull = 5
+	}
+
+	// 首次同步（latestID 还是 0）必须全量，否则拉不到历史邮件
+	if st.latestID != 0 && st.latestID == latest {
+		if st.skipCount < forceFull {
+			st.skipCount++
+			return true
+		}
+		// 到点了：这次不跳过，强制全量一遍以校正已读状态
+		st.skipCount = 0
+		return false
+	}
+
+	st.latestID = latest
+	st.skipCount = 0
+	return false
+}
+
 // syncUser 实际同步逻辑。force=true 时忽略 sync_interval。
 func (a *authManager) syncUser(email string, c *cloudMailClient, force bool) error {
 	email = normEmail(email)
@@ -181,9 +242,10 @@ func (a *authManager) syncUser(email string, c *cloudMailClient, force bool) err
 			continue
 		}
 
-		// 收件：标准接口直接返回 unread，同一份数据既入库又校正已读状态。
-		recv, err := c.fetchAllEmailList(ac.AccountID, 0)
-		if err != nil {
+		// 收件：先轻量探测，没新邮件就跳过全量，省 D1 读取额度。
+		if a.shouldSkipFullSync(email, c, ac.AccountID, 0, force) {
+			log.Printf("[sync] %s 收件 accountId=%d 无变化，跳过全量拉取（省额度）", email, ac.AccountID)
+		} else if recv, err := c.fetchAllEmailList(ac.AccountID, 0); err != nil {
 			log.Printf("[sync] %s 收件 accountId=%d ERROR: %v", email, ac.AccountID, err)
 		} else {
 			a.enrichAttachments(c, email, recv)
@@ -196,9 +258,10 @@ func (a *authManager) syncUser(email string, c *cloudMailClient, force bool) err
 			log.Printf("[sync] %s <- %s 收件 %d 封（accountId=%d）", email, ac.Email, len(recv), ac.AccountID)
 		}
 
-		// 发件：标准接口 type=1。
-		sent, err := c.fetchAllEmailList(ac.AccountID, 1)
-		if err != nil {
+		// 发件：同样先探测。
+		if a.shouldSkipFullSync(email, c, ac.AccountID, 1, force) {
+			log.Printf("[sync] %s 发件 accountId=%d 无变化，跳过全量拉取（省额度）", email, ac.AccountID)
+		} else if sent, err := c.fetchAllEmailList(ac.AccountID, 1); err != nil {
 			log.Printf("[sync] %s 发件 accountId=%d ERROR: %v", email, ac.AccountID, err)
 		} else {
 			a.enrichAttachments(c, email, sent)
