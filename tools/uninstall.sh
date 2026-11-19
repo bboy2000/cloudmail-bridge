@@ -32,10 +32,14 @@ done
 
 IMAGE=$(docker inspect -f '{{.Config.Image}}' "$NAME" 2>/dev/null || true)
 
-# 本项目证书：续期配置里写的是本目录的 certs/；不是本项目的绝不碰
+# 本项目证书：只要任一部署路径指向本安装目录，就认定属于本项目。
+# 三个路径字段都要查——不同 acme.sh 版本/安装方式写的字段不一样，
+# 有的只写 Le_RealKeyPath（证书文件手工拷贝过去的情况）。
+# 不匹配的证书绝不碰。
 DOMAINS=""
 if [ -x "$ACME" ]; then
-  DOMAINS=$(grep -lF "Le_RealCertPath='$DIR/certs" "$HOME"/.acme.sh/*/*.conf 2>/dev/null \
+  DIR="${DIR%/}"
+  DOMAINS=$(grep -lE "Le_Real(Cert|Key|FullChain)Path='$DIR/" "$HOME"/.acme.sh/*/*.conf 2>/dev/null \
             | xargs -r -n1 dirname 2>/dev/null | xargs -r -n1 basename 2>/dev/null \
             | sed 's/_ecc$//' | sort -u | tr '\n' ' ')
 fi
