@@ -1,4 +1,4 @@
-# cloudmail-bridge 安装指南 v1.13
+# cloudmail-bridge 安装指南 v1.14
 
 一个把 [cloud-mail](https://github.com/maillab/cloud-mail) 网页邮箱桥接成标准 IMAP/SMTP 服务的网关。部署后可用任意邮件客户端（Outlook、Thunderbird、Apple 邮件、手机自带邮箱等）收发 cloud-mail 里的邮件。
 
@@ -516,11 +516,8 @@ Dockerfile 与镜像内均带有版本号（`org.opencontainers.image.version`�
 - **[cloud-mail](https://github.com/maillab/cloud-mail)**（MIT）—— 邮件服务本体。网关通过它的 HTTP API 收发邮件；接口字段与附件地址规则参照其官方源码实现，代码注释中标注了对应位置。
 - **[go-imap](https://github.com/emersion/go-imap)**（MIT）—— IMAP 协议实现，网关的服务端框架。
 - **[go-smtp](https://github.com/emersion/go-smtp)**（MIT）—— SMTP 协议实现。
-- **[go-sasl](https://github.com/emersion/go-sasl)**（MIT）—— SASL 认证机制。
-- **[go-message](https://github.com/emersion/go-message)**（MIT）—— 邮件消息解析。
-- **[hydroxide](https://github.com/emersion/hydroxide)**（MIT）—— 同类的 ProtonMail 桥接网关。本项目的 `SEARCH` 条件匹配、`STATUS` 未读计数等实现参考了它的设计思路（未复制代码）。它在这些方面也有未完成的 TODO，本项目在其基础上补齐了。
 
-本仓库的代码为独立实现，未包含上述项目以外的第三方源码。
+本仓库的代码为独立实现，除上列项目及 `go.mod` 中声明的依赖外，未包含其他第三方源码。
 
 ---
 
@@ -530,4 +527,4 @@ Dockerfile 与镜像内均带有版本号（`org.opencontainers.image.version`�
 
 ---
 
-*文档版本：v1.13*
+*文档版本：v1.14*
