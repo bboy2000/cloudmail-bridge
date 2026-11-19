@@ -85,6 +85,11 @@ if [ -n "$DOMAINS" ]; then
   for d in $DOMAINS; do
     "$ACME" --remove -d "$d" --ecc >/dev/null 2>&1 && echo "[完成] 已注销 $d 的续期" \
       || echo "[注意] 注销 $d 失败，可手动执行：$ACME --remove -d $d --ecc"
+    # acme.sh --remove 只把 conf 改名，证书目录仍留着（方便恢复）。
+    # 确认已不在列表后整个删掉，否则卸载不彻底。
+    if ! "$ACME" --list 2>/dev/null | tail -n +2 | grep -q "^$d[[:space:]]"; then
+      rm -rf "$HOME/.acme.sh/${d}_ecc" 2>/dev/null && echo "[完成] 已清理 $d 的证书目录"
+    fi
   done
   if [ "$("$ACME" --list 2>/dev/null | tail -n +2 | grep -c . || echo 0)" -le 0 ]; then
     crontab -l 2>/dev/null | grep -v acme.sh | crontab - 2>/dev/null \
