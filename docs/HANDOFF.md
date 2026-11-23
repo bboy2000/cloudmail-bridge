@@ -1,8 +1,8 @@
 # cloudmail-bridge 开发交接文档
 
-**文档版本：v1.00**
+**文档版本：v1.01**
 **编写日期：2026-11-24**
-**对应代码提交：`1da951b`（README v1.14）**
+**对应代码提交：`6424333`**
 
 ---
 
@@ -45,20 +45,28 @@
 |---|---|
 | 代码 | 本地 `master` 分支，工作区干净，`go vet` 无告警，`go test` 通过 |
 | 远端 | `github.com/bboy2000/cloudmail-bridge`，默认分支 `main` |
-| **未推送提交** | **`1da951b`（README v1.14）仍未推送**，远端停在 `3c2c6d4` |
+| 同步状态 | **已同步**，远端与本地均为 `6424333`（2026-11-24 00:06 推送成功） |
 | 生产实例 | NAS 上运行中（Docker，host 网络，993/465），域名 `cm.hou.sh.cn` |
 | 已废弃实例 | 曾在一台 VPS 上部署 `kk.hou.sh.cn` 做验证，**已用 `tools/uninstall.sh` 彻底删除**（容器/镜像/目录/证书全清） |
 | CI | `.github/workflows/docker-publish.yml`，push 到 `main` 或打 `v*` tag 时构建 amd64+arm64 推 Docker Hub |
 
 ### 接手第一件事
 
+从远端 clone 即为最新代码：
+
+```bash
+git clone https://github.com/bboy2000/cloudmail-bridge.git
+```
+
+或者拿迁移包（含未入库的 `config.json`、`deploy/` 与 `.git` 历史）解压后直接开始。
+
+推送时注意分支名不一致：**本地是 `master`，远端是 `main`**。直接 `git push` 会失败，必须写完整的 `origin master:main`，或者先建跟踪关系：
+
 ```bash
 git push origin master:main
 ```
 
-> ⚠️ 注意分支名不一致：**本地是 `master`，远端是 `main`**。直接 `git push` 会失败，必须写完整的 `origin master:main`，或者先建跟踪关系。
->
-> 如果新电脑网络到 GitHub 不稳（本机曾长期 `CONNECT tunnel failed, response 502`），只能多试几次；`api.github.com` 通常比 `github.com` 稳定，可用 `curl -s https://api.github.com/repos/bboy2000/cloudmail-bridge/commits/main` 核实远端状态。
+> 如果新电脑网络到 GitHub 不稳（本机曾长期 `CONNECT tunnel failed, response 502`，靠反复重试才成功），只能多试几次；`api.github.com` 通常比 `github.com` 稳定，可用 `curl -s https://api.github.com/repos/bboy2000/cloudmail-bridge/commits/main` 核实远端状态。
 
 ---
 
@@ -277,7 +285,6 @@ go test .        # criteria_test.go（SEARCH 条件 12 例）+ store_test.go（�
 
 | 项 | 说明 |
 |---|---|
-| **推送 `1da951b`** | 见 §2，接手第一件事 |
 | **`deploy/` 整个目录未入库** | `.gitignore` 里写了 `deploy/`，导致 `git ls-files deploy/` 为空 —— 仓库里**没有** `docker-compose.yml` 和 `deploy/Dockerfile`。别人 clone 下来只能照 README 手抄 compose。compose 与 deploy/Dockerfile 本身不含密钥，建议后续把它们从忽略规则里放出来（`config.json` 仍必须忽略）。 |
 | 星标不支持 | 见 §5.5，设计取舍 |
 | 标记未读不支持 | 服务端无接口，见 §5.2 |
@@ -325,6 +332,7 @@ go test .        # criteria_test.go（SEARCH 条件 12 例）+ store_test.go（�
 - [ ] `go mod download` 拉依赖
 - [ ] `go build .` 能过、`go vet .` 无告警、`go test .` 通过
 - [ ] 恢复 `config.json`（迁移包里有，含真实凭据，注意别外泄）与 `deploy/config.json`
-- [ ] `git log` 能看到 `1da951b`，然后 `git push origin master:main` 补推
+- [ ] `git log` 能看到 `6424333`（交接文档）与 `1da951b`（README v1.14）
+- [ ] 确认远端已同步（`curl -s https://api.github.com/repos/bboy2000/cloudmail-bridge/commits/main`）
 - [ ] 确认磁盘上没有遗留的旧编译产物干扰（`*.exe`、`cloudmail-bridge-linux-*`）
 - [ ] 想连生产实例调试时，先确认 NAS 上的容器状态，别直接重启生产
