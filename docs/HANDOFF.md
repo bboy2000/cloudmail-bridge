@@ -45,7 +45,7 @@
 |---|---|
 | 代码 | 本地 `master` 分支，工作区干净，`go vet` 无告警，`go test` 通过 |
 | 远端 | `github.com/bboy2000/cloudmail-bridge`，默认分支 `main` |
-| 同步状态 | **已同步**，本地 `master` 与远端 `main` 均为 `d0d51e0`。代码内容自 `1da951b`（README v1.14）起未变；`6424333`、`d0d51e0` 两次提交仅改动本交接文档（v1.00→v1.01） |
+| 同步状态 | **已同步**，本地 `master` 与远端 `main` 指向同一提交（以 `git log -1` 为准）。代码内容自 `1da951b`（README v1.14）起未变；此后提交均为本交接文档迭代（v1.00→v1.02） |
 | 生产实例 | NAS 上运行中（Docker，host 网络，993/465），域名 `cm.hou.sh.cn` |
 | 已废弃实例 | 曾在一台 VPS 上部署 `kk.hou.sh.cn` 做验证，**已用 `tools/uninstall.sh` 彻底删除**（容器/镜像/目录/证书全清） |
 | CI | `.github/workflows/docker-publish.yml`，push 到 `main` 或打 `v*` tag 时构建 amd64+arm64 推 Docker Hub |
@@ -323,7 +323,7 @@ go test .        # criteria_test.go（SEARCH 条件 12 例）+ store_test.go（�
 |---|---|---|
 | v1.00 | `6424333` | 初版 |
 | v1.01 | `d0d51e0` | 修正同步状态：由「未推送 `1da951b`」改为「已同步」；接手第一件事改为 clone/解压迁移包 |
-| v1.02 | （本地待提交） | 修正 §10 版本号残留（v1.00→v1.02）、§2 同步状态表述（区分 HEAD `d0d51e0` 与文档基线 `6424333`） |
+| v1.02 | `59ca405` | 修正 §10 版本号残留（v1.00→v1.02）、§2 同步状态表述（区分 HEAD `d0d51e0` 与文档基线 `6424333`） |
 
 代码层面同期修复（不在 README 版本里体现）：
 - `1f5d570` 打开邮件后刷新又变回未读
